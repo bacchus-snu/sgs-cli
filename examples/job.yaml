@@ -1,0 +1,15 @@
+name: myJob
+server: myServer
+workspace: myWorkspace
+
+volume: myVolume
+gpu: 1
+image: myImage
+workingDir: myWorkingDir
+command: [my, command]
+env:
+  MY_ENV: myValue
+  MY_OTHER_ENV: myOtherValue
+secret: mySecret
+cpu: 1
+memory: 1Gi
