@@ -29,8 +29,10 @@ type ExecCredentialConfig struct {
 func GetToken() (string, error) {
 	// Create a pipe
 	r, w, err := os.Pipe()
+	defer r.Close()
+	defer w.Close()
 	if err != nil {
-		return "", fmt.Errorf("Failed to create pipe: %v", err)
+		return "", fmt.Errorf("Failed to create pipe: %w", err)
 	}
 
 	// Create a Cmd instance
@@ -50,24 +52,22 @@ func GetToken() (string, error) {
 	}
 	version := "HEAD"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	code := cmdInterface.Run(ctx, args, version)
 	if code != 0 {
 		return "", fmt.Errorf("Failed to get token. Exit code: %d", code)
 	}
-	defer w.Close()
-	defer cancel()
 
 	// Read the token from the pipe
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return "", fmt.Errorf("Failed to read token: %v", err)
+		return "", fmt.Errorf("Failed to read token: %w", err)
 	}
-	defer r.Close()
 
 	// Parse the result in JSON format
 	var result ExecCredentialConfig
 	if err := json.Unmarshal(data, &result); err != nil {
-		return "", fmt.Errorf("Failed to parse token: %v", err)
+		return "", fmt.Errorf("Failed to parse token: %w", err)
 	}
 
 	return result.Status.Token, nil
