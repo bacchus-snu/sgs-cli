@@ -1,8 +1,15 @@
 package main
 
+import (
+	"log"
+)
+
 func main() {
 	// Download the kubeconfig file
-	DownloadKubeconfig()
+	err := DownloadKubeconfig()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	// Parse the configuration
 	behavior, subject, sgsConfig := ParseSGSConfig()
@@ -11,7 +18,10 @@ func main() {
 	CheckSGSConfig(behavior, subject, sgsConfig)
 
 	// Get the token
-	token := GetToken()
+	token, err := GetToken()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	// Get the request
 	request := GetRequest(behavior, subject, sgsConfig)
