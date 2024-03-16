@@ -13,9 +13,6 @@ func main() {
 	// Get the token
 	token := GetToken()
 
-	// Get the request
-	request := GetRequest(behavior, subject, sgsConfig)
-
 	// Send the request with token to the server via kubectl
-	SendRequest(request, token)
+	SendRequest(behavior, subject, sgsConfig, token)
 }
