@@ -120,6 +120,17 @@ func ParseSGSConfig() (string, string, SGSConfig) {
 }
 
 func CheckSGSConfig(behavior string, subject string, sgsConfig SGSConfig) {
+	// Check the common fields
+	if sgsConfig.Name == "" {
+		log.Fatalf("Name is required")
+	}
+	if sgsConfig.Server == "" {
+		log.Fatalf("Server is required")
+	}
+	if sgsConfig.Workspace == "" {
+		log.Fatalf("Workspace is required")
+	}
+
 	// Check the behavior
 	switch behavior {
 	case "create":
@@ -146,37 +157,23 @@ func CheckSGSConfig(behavior string, subject string, sgsConfig SGSConfig) {
 			log.Fatalf("Invalid subject: %s", subject)
 		}
 	case "delete":
+		// No additional fields are required for deleting a job, volume, or secret
 		switch subject {
 		case "job":
-			if sgsConfig.Volume == "" {
-				log.Fatalf("Volume is required for deleting a job")
-			}
 		case "volume":
-			if sgsConfig.Size == "" {
-				log.Fatalf("Size is required for deleting a volume")
-			}
 		case "secret":
-			if len(sgsConfig.Data) == 0 {
-				log.Fatalf("Data is required for deleting a secret")
-			}
 		default:
 			log.Fatalf("Invalid subject: %s", subject)
 		}
 	case "log":
 		switch subject {
 		case "job":
-			if sgsConfig.Volume == "" {
-				log.Fatalf("Volume is required for logging a job")
-			}
 		default:
 			log.Fatalf("Invalid subject: %s", subject)
 		}
 	case "connect":
 		switch subject {
 		case "volume":
-			if sgsConfig.Size == "" {
-				log.Fatalf("Size is required for connecting a volume")
-			}
 		default:
 			log.Fatalf("Invalid subject: %s", subject)
 		}
