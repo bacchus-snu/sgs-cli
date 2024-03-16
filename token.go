@@ -29,11 +29,11 @@ type ExecCredentialConfig struct {
 func GetToken() (string, error) {
 	// Create a pipe
 	r, w, err := os.Pipe()
-	defer r.Close()
-	defer w.Close()
 	if err != nil {
 		return "", fmt.Errorf("Failed to create pipe: %w", err)
 	}
+	defer r.Close()
+	defer w.Close()
 
 	// Create a Cmd instance
 	clockReal := &clock.Real{}
