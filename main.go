@@ -17,5 +17,8 @@ func main() {
 	// Get the token
 	token := GetToken()
 
+	// Make kubectl configuration
+	// kubectlConfig := GetKubectlConfig(behavior, subject, sgsConfig)
+
 	fmt.Println(token)
 }
