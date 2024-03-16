@@ -1,9 +1,5 @@
 package main
 
-import (
-	"fmt"
-)
-
 func main() {
 	// Download the kubeconfig file
 	DownloadKubeconfig()
@@ -17,8 +13,9 @@ func main() {
 	// Get the token
 	token := GetToken()
 
-	// Make kubectl configuration
-	// kubectlConfig := GetKubectlConfig(behavior, subject, sgsConfig)
+	// Get the request
+	request := GetRequest(behavior, subject, sgsConfig)
 
-	fmt.Println(token)
+	// Send the request with token to the server via kubectl
+	SendRequest(request, token)
 }
