@@ -81,6 +81,12 @@ func ParseSGSConfig() (string, string, SGSConfig) {
 	// Read the name from command line flag
 	name := flag.String("n", "", "Name")
 
+	// Read the server from command line flag
+	server := flag.String("s", "", "Server")
+
+	// Read the workspace from command line flag
+	workspace := flag.String("w", "", "Workspace")
+
 	// Read the file name from command line flag
 	fileName := flag.String("f", "", "Path to the YAML file")
 
@@ -114,6 +120,16 @@ func ParseSGSConfig() (string, string, SGSConfig) {
 	// Override the name if provided
 	if *name != "" {
 		sgsConfig.Name = *name
+	}
+
+	// Override the server if provided
+	if *server != "" {
+		sgsConfig.Server = *server
+	}
+
+	// Override the workspace if provided
+	if *workspace != "" {
+		sgsConfig.Workspace = *workspace
 	}
 
 	return behavior, subject, sgsConfig
