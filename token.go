@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
-	"log"
 	"os"
+	"time"
 
 	"github.com/int128/kubelogin/pkg/di"
 	"github.com/int128/kubelogin/pkg/infrastructure/browser"
@@ -25,12 +26,14 @@ type ExecCredentialConfig struct {
 	} `json:"status"`
 }
 
-func GetToken() string {
+func GetToken() (string, error) {
 	// Create a pipe
 	r, w, err := os.Pipe()
 	if err != nil {
-		log.Fatalf("Failed to create pipe: %v", err)
+		return "", fmt.Errorf("Failed to create pipe: %w", err)
 	}
+	defer r.Close()
+	defer w.Close()
 
 	// Create a Cmd instance
 	clockReal := &clock.Real{}
@@ -48,24 +51,24 @@ func GetToken() string {
 		"--oidc-use-pkce",
 	}
 	version := "HEAD"
-	code := cmdInterface.Run(context.Background(), args, version)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	code := cmdInterface.Run(ctx, args, version)
 	if code != 0 {
-		log.Fatalf("Failed to get token: %d", code)
+		return "", fmt.Errorf("Failed to get token. Exit code: %d", code)
 	}
-	w.Close()
 
 	// Read the token from the pipe
 	data, err := io.ReadAll(r)
 	if err != nil {
-		log.Fatalf("Failed to read token: %v", err)
+		return "", fmt.Errorf("Failed to read token: %w", err)
 	}
-	r.Close()
 
 	// Parse the result in JSON format
 	var result ExecCredentialConfig
 	if err := json.Unmarshal(data, &result); err != nil {
-		log.Fatalf("Failed to parse token: %v", err)
+		return "", fmt.Errorf("Failed to parse token: %w", err)
 	}
 
-	return result.Status.Token
+	return result.Status.Token, nil
 }
