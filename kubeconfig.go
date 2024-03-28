@@ -18,27 +18,27 @@ func DownloadKubeconfig() error {
 		// Create the directory if it doesn't exist
 		err := os.MkdirAll(filepath.Dir(destinationPath), 0755)
 		if err != nil {
-			return fmt.Errorf("Failed to create directory: %w", err)
+			return fmt.Errorf("failed to create directory: %w", err)
 		}
 
 		// Download the kubeconfig file
 		response, err := http.Get(kubeconfigURL)
 		if err != nil {
-			return fmt.Errorf("Failed to download kubeconfig file: %w", err)
+			return fmt.Errorf("failed to download kubeconfig file: %w", err)
 		}
 		defer response.Body.Close()
 
 		// Create the file
 		file, err := os.Create(destinationPath)
 		if err != nil {
-			return fmt.Errorf("Failed to create file: %w", err)
+			return fmt.Errorf("failed to create file: %w", err)
 		}
 		defer file.Close()
 
 		// Copy the response body to the file
 		_, err = io.Copy(file, response.Body)
 		if err != nil {
-			return fmt.Errorf("Failed to save kubeconfig file: %w", err)
+			return fmt.Errorf("failed to save kubeconfig file: %w", err)
 		}
 
 		log.Printf("Kubeconfig file downloaded successfully")

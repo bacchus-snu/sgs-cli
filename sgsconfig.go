@@ -15,13 +15,19 @@ type SGSConfig struct {
 	Workspace string `yaml:"workspace"`
 
 	// Job specific fields
-	Volume     string            `yaml:"volume"`
-	GPU        string            `yaml:"gpu"`
-	Image      string            `yaml:"image"`
-	WorkingDir string            `yaml:"workingDir"`
-	Command    []string          `yaml:"command"`
-	Env        map[string]string `yaml:"env"`
-	Secret     string            `yaml:"secret"`
+	VolumeMounts []struct {
+		Name      string `yaml:"name"`
+		MountPath string `yaml:"mountPath"`
+	} `yaml:"volumeMounts"`
+	GPU        string   `yaml:"gpu"`
+	Image      string   `yaml:"image"`
+	WorkingDir string   `yaml:"workingDir"`
+	Command    []string `yaml:"command"`
+	Env        []struct {
+		Name  string `yaml:"name"`
+		Value string `yaml:"value"`
+	} `yaml:"env"`
+	Secret string `yaml:"secret"`
 
 	// Volume specific fields
 	Size string `yaml:"size"`
@@ -111,9 +117,6 @@ func CheckSGSConfig(behavior string, subject string, sgsConfig SGSConfig) {
 	case "create":
 		switch subject {
 		case "job":
-			if sgsConfig.Volume == "" {
-				log.Fatalf("Volume is required for creating a job")
-			}
 			if sgsConfig.Image == "" {
 				log.Fatalf("Image is required for creating a job")
 			}
