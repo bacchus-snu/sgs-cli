@@ -1,6 +1,1 @@
-bin/
-
-review.py
-code_review.md
-*test.go
-default.nix
+sgs-cli
