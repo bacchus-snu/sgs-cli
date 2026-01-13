@@ -30,7 +30,7 @@ const (
 	AnnotationOSImage = "sgs.bacchus.io/os-image"
 
 	// Hardcoded values
-	DefaultImage       = "nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04"
+	DefaultImage       = "nvcr.io/nvidia/cuda:12.5.0-base-ubuntu22.04"
 	DefaultStorageSize = "10Gi"
 
 	// Edit mode defaults
@@ -136,11 +136,11 @@ func List(ctx context.Context, c *client.Client) ([]VolumeInfo, error) {
 		// Check if there's an init pod (volume is being initialized)
 		initPodName := "init-" + pvc.Name
 		initPod, initErr := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, initPodName, metav1.GetOptions{})
-		
+
 		// Check if there's an associated pod
 		pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
 		status := string(pvc.Status.Phase) // Default to PVC status (Bound, Pending, etc.)
-		
+
 		if initErr == nil {
 			// Init pod exists - show initializing status
 			switch initPod.Status.Phase {
@@ -385,6 +385,16 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 				{
 					Name:  "init",
 					Image: image,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0"),
+							corev1.ResourceMemory: resource.MustParse("0"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(EditCPULimit),
+							corev1.ResourceMemory: resource.MustParse(EditMemoryLimit),
+						},
+					},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "rootfs-storage",
@@ -583,13 +593,10 @@ func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, er
 	}
 
 	// Calculate resources per GPU: (7/8) of resources divided by total GPUs
-	// CPU per GPU = (7 * totalCPU) / (8 * totalGPU)
-	// Memory per GPU = (7 * totalMemory) / (8 * totalGPU)
-	cpuPerGPU := (7 * totalCPU) / (8 * totalGPU)
-	memPerGPU := (7 * totalMemory) / (8 * totalGPU)
-
-	cpuLimit := cpuPerGPU * int64(opts.GPUs)
-	memLimit := memPerGPU * int64(opts.GPUs)
+	// CPU limit = (7 * totalCPU * gpusRequested) / (8 * totalGPU)
+	// Memory limit = (7 * totalMemory * gpusRequested) / (8 * totalGPU)
+	cpuLimit := (7 * totalCPU * int64(opts.GPUs)) / (8 * totalGPU)
+	memLimit := (7 * totalMemory * int64(opts.GPUs)) / (8 * totalGPU)
 
 	// Create pod with GPU resources
 	pod := createRunPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, sessionNumber, opts.GPUs, cpuLimit, memLimit, opts.Command, opts.Mounts, c.Namespace)
@@ -639,9 +646,6 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 		})
 	}
 
-	// Edit mode: 4 CPU limit, 16Gi memory limit, no requests
-	zero := resource.MustParse("0")
-
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -663,8 +667,8 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 					Image: image,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    zero,
-							corev1.ResourceMemory: zero,
+							corev1.ResourceCPU:    resource.MustParse("0"),
+							corev1.ResourceMemory: resource.MustParse("0"),
 						},
 						Limits: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse(EditCPULimit),
@@ -687,7 +691,7 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 // createRunPodSpec creates a pod for run mode (with GPU)
 func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sessionNumber, gpus int, cpuLimit, memLimit int64, command []string, mounts []MountOption, namespace string) *corev1.Pod {
 	// Build volume mounts and volumes
-	volumeMounts := []corev1.VolumeMount{
+	volumeMount := []corev1.VolumeMount{
 		{
 			Name:      "rootfs-storage",
 			MountPath: "/persistent_root",
@@ -707,7 +711,7 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sess
 	// Add additional mounts
 	for i, m := range mounts {
 		volName := fmt.Sprintf("mount-%d", i)
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		volumeMount = append(volumeMount, corev1.VolumeMount{
 			Name:      volName,
 			MountPath: m.MountPath,
 		})
@@ -721,11 +725,39 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sess
 		})
 	}
 
-	// Run mode: calculated CPU/memory limits based on GPU count, no requests
-	zero := resource.MustParse("0")
+	// Determine if this is interactive mode (no command) or batch mode (with command)
+	interactive := len(command) == 0
+	var initScript string
+	if interactive {
+		initScript = getInitScript() // Same as edit mode - interactive shell
+	} else {
+		initScript = getRunInitScript(command)
+	}
 
-	// Build the init script with the user command
-	initScript := getRunInitScript(command)
+	container := corev1.Container{
+		Name:  "work-node",
+		Image: image,
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("0"),
+				corev1.ResourceMemory: resource.MustParse("0"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:                    *resource.NewQuantity(cpuLimit, resource.DecimalSI),
+				corev1.ResourceMemory:                 *resource.NewQuantity(memLimit, resource.BinarySI),
+				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse(fmt.Sprintf("%d", gpus)),
+			},
+		},
+		VolumeMounts: volumeMount,
+		Command:      []string{"/bin/bash", "-c"},
+		Args:         []string{initScript},
+	}
+
+	// Enable TTY and Stdin for interactive mode
+	if interactive {
+		container.Stdin = true
+		container.TTY = true
+	}
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -742,26 +774,7 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sess
 			NodeSelector: map[string]string{
 				"kubernetes.io/hostname": nodeName,
 			},
-			Containers: []corev1.Container{
-				{
-					Name:  "work-node",
-					Image: image,
-					Resources: corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    zero,
-							corev1.ResourceMemory: zero,
-						},
-						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:                    *resource.NewQuantity(cpuLimit, resource.DecimalSI),
-							corev1.ResourceMemory:                 *resource.NewQuantity(memLimit, resource.BinarySI),
-							corev1.ResourceName("nvidia.com/gpu"): resource.MustParse(fmt.Sprintf("%d", gpus)),
-						},
-					},
-					VolumeMounts: volumeMounts,
-					Command:      []string{"/bin/bash", "-c"},
-					Args:         []string{initScript},
-				},
-			},
+			Containers:    []corev1.Container{container},
 			Volumes:       volumes,
 			RestartPolicy: corev1.RestartPolicyNever,
 		},
@@ -774,30 +787,87 @@ func getInitScript() string {
 	return `set -e
 TARGET="/persistent_root"
 
-# Initialize persistent root if not done
-if [ ! -d "$TARGET/etc" ]; then
-  echo "Initializing persistent root filesystem..."
-  for dir in bin etc lib lib64 sbin usr var opt root home; do
-    if [ -d "/$dir" ]; then cp -a "/$dir" "$TARGET/"; fi
-  done
-  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys" "$TARGET/tmp" "$TARGET/run"
-  chmod 1777 "$TARGET/tmp"
+# Install proot if not available
+if ! command -v proot &> /dev/null; then
+  apt-get update && apt-get install -y proot
 fi
 
-# Create symlinks for device nodes (these point to host /dev via /persistent_root/../dev)
-# We'll set up PATH to use the persistent root
-cd "$TARGET"
+# Create proot entry script for easy access
+cat > /usr/local/bin/proot-shell << 'SCRIPT'
+#!/bin/bash
+TARGET="/persistent_root"
+PROOT_BINDS=""
+for bin in /usr/bin/nvidia-*; do
+  [ -f "$bin" ] && PROOT_BINDS="$PROOT_BINDS -b $bin"
+done
+for lib in /usr/lib/x86_64-linux-gnu/lib{nvidia,cuda}*.so*; do
+  [ -f "$lib" ] && PROOT_BINDS="$PROOT_BINDS -b $lib"
+done
+exec proot -r "$TARGET" \
+  -b /dev -b /dev/shm -b /proc -b /sys \
+  -b /etc/hosts -b /etc/resolv.conf -b /etc/nsswitch.conf \
+  -b /etc/ssl/certs -b /usr/share/ca-certificates \
+  -b /run/nvidia-persistenced \
+  -b /usr/lib/firmware/nvidia \
+  $PROOT_BINDS \
+  -w /root /bin/bash "$@"
+SCRIPT
+chmod +x /usr/local/bin/proot-shell
 
-# Set up environment to use persistent root binaries and libs
-export PATH="$TARGET/usr/local/sbin:$TARGET/usr/local/bin:$TARGET/usr/sbin:$TARGET/usr/bin:$TARGET/sbin:$TARGET/bin:$PATH"
-export LD_LIBRARY_PATH="$TARGET/usr/local/lib:$TARGET/usr/lib/x86_64-linux-gnu:$TARGET/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
-export HOME="$TARGET/root"
+# Initialize persistent rootfs (first run only)
+if [ ! -d "$TARGET/usr" ]; then
+  echo "Initializing persistent rootfs..."
 
-# Keep container running
-tail -f /dev/null`
+  # Install debug tools before copying
+  apt-get update && apt-get install -y \
+    curl wget iputils-ping net-tools dnsutils \
+    vim less htop python3 python3-pip
+
+  for dir in bin etc lib lib64 sbin usr var opt root home tmp; do
+    [ -d "/$dir" ] && cp -a "/$dir" "$TARGET/"
+  done
+  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys"
+  mkdir -p "$TARGET/run/nvidia-persistenced"
+  mkdir -p "$TARGET/tmp/vgpulock"
+  chmod 1777 "$TARGET/tmp"
+
+  # Disable apt sandbox for proot compatibility
+  echo 'APT::Sandbox::User "root";' > "$TARGET/etc/apt/apt.conf.d/99sandbox-off"
+fi
+
+# Save environment for proot session
+export -p > "$TARGET/tmp/orig_env.sh"
+
+# Build proot bind options for NVIDIA binaries and libraries
+PROOT_BINDS=""
+for bin in /usr/bin/nvidia-*; do
+  [ -f "$bin" ] && PROOT_BINDS="$PROOT_BINDS -b $bin"
+done
+for lib in /usr/lib/x86_64-linux-gnu/lib{nvidia,cuda}*.so*; do
+  [ -f "$lib" ] && PROOT_BINDS="$PROOT_BINDS -b $lib"
+done
+
+# Enter persistent rootfs with proot (no root privilege required)
+exec proot \
+  -r "$TARGET" \
+  -b /dev \
+  -b /dev/shm \
+  -b /proc \
+  -b /sys \
+  -b /etc/hosts \
+  -b /etc/resolv.conf \
+  -b /etc/nsswitch.conf \
+  -b /etc/ssl/certs \
+  -b /usr/share/ca-certificates \
+  -b /run/nvidia-persistenced \
+  -b /usr/lib/firmware/nvidia \
+  $PROOT_BINDS \
+  -w /root \
+  /bin/bash`
 }
 
 // getRunInitScript returns the initialization script for run mode (executes command then exits)
+// Uses proot for user-space chroot that doesn't require privileges
 func getRunInitScript(command []string) string {
 	// Escape the command for shell
 	escapedCmd := ""
@@ -812,24 +882,65 @@ func getRunInitScript(command []string) string {
 	return fmt.Sprintf(`set -e
 TARGET="/persistent_root"
 
-# Initialize persistent root if not done
-if [ ! -d "$TARGET/etc" ]; then
-  echo "Initializing persistent root filesystem..."
-  for dir in bin etc lib lib64 sbin usr var opt root home; do
-    if [ -d "/$dir" ]; then cp -a "/$dir" "$TARGET/"; fi
-  done
-  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys" "$TARGET/tmp" "$TARGET/run"
-  chmod 1777 "$TARGET/tmp"
+# Install proot if not available
+if ! command -v proot &> /dev/null; then
+  apt-get update && apt-get install -y proot
 fi
 
-# Set up environment to use persistent root binaries and libs
-cd "$TARGET"
-export PATH="$TARGET/usr/local/sbin:$TARGET/usr/local/bin:$TARGET/usr/sbin:$TARGET/usr/bin:$TARGET/sbin:$TARGET/bin:$PATH"
-export LD_LIBRARY_PATH="$TARGET/usr/local/lib:$TARGET/usr/lib/x86_64-linux-gnu:$TARGET/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
-export HOME="$TARGET/root"
+# Initialize persistent rootfs (first run only)
+if [ ! -d "$TARGET/usr" ]; then
+  echo "Initializing persistent rootfs..."
 
-# Execute the user command
-%s`, escapedCmd)
+  # Install debug tools before copying
+  apt-get update && apt-get install -y \
+    curl wget iputils-ping net-tools dnsutils \
+    vim less htop python3 python3-pip
+
+  for dir in bin boot etc home lib lib64 media mnt opt root sbin srv tmp usr var; do
+    [ -d "/$dir" ] && cp -a "/$dir" "$TARGET/"
+  done
+  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys"
+  mkdir -p "$TARGET/run/nvidia-persistenced"
+  mkdir -p "$TARGET/tmp/vgpulock"
+  chmod 1777 "$TARGET/tmp"
+
+  # Disable apt sandbox for proot compatibility
+  echo 'APT::Sandbox::User "root";' > "$TARGET/etc/apt/apt.conf.d/99sandbox-off"
+fi
+
+# Save environment for proot session
+export -p > "$TARGET/tmp/orig_env.sh"
+
+# Build proot bind options for NVIDIA binaries and libraries
+PROOT_BINDS=""
+for bin in /usr/bin/nvidia-*; do
+  [ -f "$bin" ] && PROOT_BINDS="$PROOT_BINDS -b $bin"
+done
+for lib in /usr/lib/x86_64-linux-gnu/lib{nvidia,cuda}*.so*; do
+  [ -f "$lib" ] && PROOT_BINDS="$PROOT_BINDS -b $lib"
+done
+
+# Enter persistent rootfs with proot and execute the user command
+exec proot \
+  -r "$TARGET" \
+  -b /dev \
+  -b /dev/shm \
+  -b /proc \
+  -b /sys \
+  -b /etc/hosts \
+  -b /etc/resolv.conf \
+  -b /etc/nsswitch.conf \
+  -b /etc/ssl/certs \
+  -b /usr/share/ca-certificates \
+  -b /run/nvidia-persistenced \
+  -b /usr/lib/firmware/nvidia \
+  $PROOT_BINDS \
+  -w /root \
+  /bin/bash -c "
+    source /tmp/orig_env.sh 2>/dev/null || true
+    ldconfig 2>/dev/null || true
+    %s
+  "`, escapedCmd)
 }
 
 // escapeShellArg escapes single quotes in a shell argument

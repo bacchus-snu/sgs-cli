@@ -13,9 +13,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const (
-	defaultImage = "nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04"
-)
 
 var (
 	createSize    string
@@ -100,8 +97,8 @@ func init() {
 	createCmd.AddCommand(createSessionCmd)
 
 	createVolumeCmd.Flags().StringVar(&createSize, "size", "", "Storage size (default: 10Gi)")
-	createVolumeCmd.Flags().StringVar(&createImage, "image", "", "Container image for OS volume (default: "+defaultImage+")")
-	createVolumeCmd.Flags().Lookup("image").NoOptDefVal = defaultImage
+	createVolumeCmd.Flags().StringVar(&createImage, "image", "", "Container image for OS volume (default: "+volume.DefaultImage+")")
+	createVolumeCmd.Flags().Lookup("image").NoOptDefVal = volume.DefaultImage
 
 	createSessionCmd.Flags().IntVar(&sessionGPUs, "gpu", 0, "Number of GPUs (0 for edit mode, 1+ for run mode)")
 	createSessionCmd.Flags().StringArrayVar(&sessionCmd, "command", nil, "Command to run (required for run mode)")
@@ -195,9 +192,6 @@ func runCreateSession(cmd *cobra.Command, args []string) {
 		runEditSession(ctx, k8sClient, nodeName, volumeName, mounts)
 	} else {
 		// Run mode (session 1+)
-		if len(sessionCmd) == 0 {
-			exitWithError("--command is required when using --gpu", nil)
-		}
 		if sessionNumber != -1 && sessionNumber < 1 {
 			exitWithError("run session (with --gpu) must have session number >= 1", nil)
 		}
@@ -249,16 +243,39 @@ func runGPUSession(ctx context.Context, k8sClient *client.Client, nodeName, volu
 		SessionNumber: requestedNumber, // -1 means auto-assign
 	}
 
-	fmt.Printf("Starting run session with %d GPU(s) on %s/%s...\n", gpus, nodeName, volumeName)
+	interactive := len(command) == 0
+	if interactive {
+		fmt.Printf("Starting interactive run session with %d GPU(s) on %s/%s...\n", gpus, nodeName, volumeName)
+	} else {
+		fmt.Printf("Starting run session with %d GPU(s) on %s/%s...\n", gpus, nodeName, volumeName)
+	}
 
 	result, err := volume.Run(ctx, k8sClient, opts)
 	if err != nil {
 		exitWithError("failed to start run session", err)
 	}
 
-	fmt.Printf("Run session started: %s/%s/%d\n", nodeName, volumeName, result.SessionNumber)
-	fmt.Printf("Use 'sgs logs %s/%s/%d' to view output\n", nodeName, volumeName, result.SessionNumber)
-	fmt.Printf("Use 'sgs delete session %s/%s/%d' to stop\n", nodeName, volumeName, result.SessionNumber)
+	podName := result.PodName
+	sessionNum := result.SessionNumber
+
+	if interactive {
+		// Wait for pod to be ready and attach
+		fmt.Println("Waiting for pod to be ready...")
+		if err := volume.WaitForPodReady(ctx, k8sClient, podName, 5*time.Minute); err != nil {
+			exitWithError("pod failed to become ready", err)
+		}
+
+		fmt.Printf("Attaching to shell (use 'sgs delete session %s/%s/%d' to delete)...\n", nodeName, volumeName, sessionNum)
+
+		// Attach to the pod
+		if err := volume.Attach(ctx, k8sClient, podName, os.Stdin, os.Stdout, os.Stderr); err != nil {
+			exitWithError("failed to attach to pod", err)
+		}
+	} else {
+		fmt.Printf("Run session started: %s/%s/%d\n", nodeName, volumeName, sessionNum)
+		fmt.Printf("Use 'sgs logs %s/%s/%d' to view output\n", nodeName, volumeName, sessionNum)
+		fmt.Printf("Use 'sgs delete session %s/%s/%d' to stop\n", nodeName, volumeName, sessionNum)
+	}
 }
 
 // parseMounts parses mount options from strings like "node/volume:/path"

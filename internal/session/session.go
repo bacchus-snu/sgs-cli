@@ -189,18 +189,25 @@ func podToSessionInfo(pod *corev1.Pod) SessionInfo {
 	// Extract command and GPU count from containers
 	for _, container := range pod.Spec.Containers {
 		if container.Name == "work-node" {
-			// For run sessions, the user command is embedded in args as the last quoted string
-			// after "# Execute the user command\n"
+			// For run sessions, the user command is embedded in args
+			// The command is inside the proot bash -c block at the end
 			if len(container.Args) > 0 {
 				arg := container.Args[len(container.Args)-1]
-				if idx := strings.Index(arg, "# Execute the user command\n"); idx != -1 {
-					cmd := strings.TrimPrefix(arg[idx:], "# Execute the user command\n")
-					// Remove surrounding quotes if present
-					cmd = strings.TrimSpace(cmd)
-					if len(cmd) >= 2 && cmd[0] == '\'' && cmd[len(cmd)-1] == '\'' {
-						cmd = cmd[1 : len(cmd)-1]
+				// Look for the pattern in proot's bash -c command
+				// The command is after "ldconfig 2>/dev/null || true\n"
+				if idx := strings.Index(arg, "ldconfig 2>/dev/null || true"); idx != -1 {
+					remaining := arg[idx:]
+					// Find the newline after ldconfig line
+					if nlIdx := strings.Index(remaining, "\n"); nlIdx != -1 {
+						cmd := strings.TrimSpace(remaining[nlIdx+1:])
+						// Remove trailing whitespace and closing quote/brace
+						cmd = strings.TrimRight(cmd, " \n\t\"")
+						// Remove surrounding quotes if present
+						if len(cmd) >= 2 && cmd[0] == '\'' && cmd[len(cmd)-1] == '\'' {
+							cmd = cmd[1 : len(cmd)-1]
+						}
+						info.Command = cmd
 					}
-					info.Command = cmd
 				}
 			}
 		}
