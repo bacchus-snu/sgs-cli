@@ -1,2 +1,56 @@
-sgs-cli
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/sgs
+
+# Build artifacts
+dist/
+*.tar.gz
+*.zip
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local configuration (user-specific)
+*.local.yaml
+*.local.yml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Log files
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Downloaded kubeconfig (should be in ~/.sgs/), only for local testing
 config.yaml
