@@ -8,9 +8,8 @@ A command line interface for SNUCSE GPU Service. It provides a VM-like experienc
 ## Features
 
 - **VM-like Experience**: Create persistent volumes that feel like virtual machines
-- **Simple Interface**: Only two concepts - nodes and volumes
-- **GPU Support**: Integrated with HAMI scheduler for GPU resource management
-- **Workspace Management**: Namespace-based workspace isolation
+- **Simple Interface**: Only three concepts - nodes, volumes, and sessions
+- **Workspace Management**: Namespace-based workspace isolation and resource quota management, shared with multiple users
 
 ## Project Structure
 
@@ -101,7 +100,7 @@ sgs get workspaces
 ### Volume Management
 
 ```bash
-# Create an OS volume (with container image)
+# Create an OS volume (with default container image)
 sgs create volume ferrari/os-volume --image
 
 # Create an OS volume with custom image
@@ -119,7 +118,7 @@ sgs delete volume ferrari/os-volume
 Sessions run on OS volumes. Two types exist:
 
 - **Edit session (0)**: Interactive shell, no GPU, limited resources
-- **Run session (1+)**: GPU workloads with specified command
+- **Run session (1+)**: GPU workloads with specified command, may be shutdown under low GPU utilization
 
 ```bash
 # Start an edit session (interactive shell)
