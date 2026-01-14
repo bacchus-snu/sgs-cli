@@ -1,3 +1,5 @@
+// SGS CLI - Command line interface for SNUCSE GPU Service.
+// This is the main entry point for the sgs command.
 package main
 
 import (

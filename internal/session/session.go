@@ -1,3 +1,4 @@
+// Package session provides session listing and info for SGS.
 package session
 
 import (
@@ -8,36 +9,31 @@ import (
 	"time"
 
 	"github.com/bacchus-snu/sgs-cli/internal/client"
+	"github.com/bacchus-snu/sgs-cli/internal/sgs"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const (
-	// Label keys for SGS-managed resources
-	LabelManagedBy     = "app.kubernetes.io/managed-by"
-	LabelVolumeName    = "sgs.bacchus.io/volume-name"
-	LabelNodeName      = "sgs.bacchus.io/node-name"
-	LabelSessionNumber = "sgs.bacchus.io/session-number"
-)
-
-// SessionType represents the type of session (determined by session number: 0=edit, 1+=run)
+// SessionType represents the type of session
 type SessionType string
 
-const (
+// Session type values - these use the hardcoded defaults and are
+// compared against the runtime sgs.SessionModeEdit/Run values.
+var (
 	SessionTypeEdit SessionType = "edit"
 	SessionTypeRun  SessionType = "run"
 )
 
 // SessionInfo represents information about an SGS session (running pod)
 type SessionInfo struct {
-	PodName    string      // Internal pod name
-	Number     int         // Session number (0 for edit, 0-N for run)
-	VolumeName string      // Volume name without node prefix
+	PodName    string // Internal pod name
+	VolumeName string // Volume name without node prefix
 	Type       SessionType
 	Node       string
 	Status     string
 	GPUs       int
+	GPUMem     int64 // GPU memory in MiB (HAMi)
 	Age        string
 	Command    string // Command being run (for run sessions)
 }
@@ -49,12 +45,15 @@ type LogsOptions struct {
 }
 
 // List returns all sessions (pods) in the current namespace
+// Excludes system pods (init, copy) by filtering on session-mode label
 func List(ctx context.Context, c *client.Client) ([]SessionInfo, error) {
-	pods, err := c.Clientset.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=sgs", LabelManagedBy),
+	pods, err := client.RetryWithContext(ctx, func() (*corev1.PodList, error) {
+		return c.Clientset.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=sgs,%s", sgs.LabelManagedBy, sgs.LabelSessionMode),
+		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
+		return nil, client.FormatK8sError(err, "list", "sessions", c.Namespace)
 	}
 
 	var sessions []SessionInfo
@@ -67,11 +66,13 @@ func List(ctx context.Context, c *client.Client) ([]SessionInfo, error) {
 
 // ListByVolume returns all sessions for a specific volume
 func ListByVolume(ctx context.Context, c *client.Client, volumeName string) ([]SessionInfo, error) {
-	pods, err := c.Clientset.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=sgs,%s=%s", LabelManagedBy, LabelVolumeName, volumeName),
+	pods, err := client.RetryWithContext(ctx, func() (*corev1.PodList, error) {
+		return c.Clientset.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=sgs,%s=%s,%s", sgs.LabelManagedBy, sgs.LabelVolumeName, volumeName, sgs.LabelSessionMode),
+		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
+		return nil, client.FormatK8sError(err, "list", "sessions", c.Namespace)
 	}
 
 	var sessions []SessionInfo
@@ -84,12 +85,14 @@ func ListByVolume(ctx context.Context, c *client.Client, volumeName string) ([]S
 
 // ListByNode returns all sessions on a specific node
 func ListByNode(ctx context.Context, c *client.Client, nodeName string) ([]SessionInfo, error) {
-	pods, err := c.Clientset.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=sgs", LabelManagedBy),
-		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+	pods, err := client.RetryWithContext(ctx, func() (*corev1.PodList, error) {
+		return c.Clientset.CoreV1().Pods(c.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=sgs,%s", sgs.LabelManagedBy, sgs.LabelSessionMode),
+			FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
+		return nil, client.FormatK8sError(err, "list", "sessions", c.Namespace)
 	}
 
 	var sessions []SessionInfo
@@ -102,16 +105,18 @@ func ListByNode(ctx context.Context, c *client.Client, nodeName string) ([]Sessi
 
 // Get returns information about a specific session
 func Get(ctx context.Context, c *client.Client, sessionName string) (*SessionInfo, error) {
-	pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, sessionName, metav1.GetOptions{})
+	pod, err := client.RetryWithContext(ctx, func() (*corev1.Pod, error) {
+		return c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, sessionName, metav1.GetOptions{})
+	})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return nil, fmt.Errorf("session not found: %s", sessionName)
+			return nil, fmt.Errorf("session %q not found in workspace %q", sessionName, c.Namespace)
 		}
-		return nil, fmt.Errorf("failed to get session: %w", err)
+		return nil, client.FormatK8sError(err, "get", "session", c.Namespace)
 	}
 
 	// Check if it's an SGS-managed pod
-	if pod.Labels[LabelManagedBy] != "sgs" {
+	if pod.Labels[sgs.LabelManagedBy] != "sgs" {
 		return nil, fmt.Errorf("session not found: %s", sessionName)
 	}
 
@@ -140,7 +145,7 @@ func Logs(ctx context.Context, c *client.Client, sessionName string, opts LogsOp
 	req := c.Clientset.CoreV1().Pods(c.Namespace).GetLogs(sessionName, logOpts)
 	stream, err := req.Stream(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to get logs: %w", err)
+		return "", client.FormatK8sError(err, "get", "logs", c.Namespace)
 	}
 	defer stream.Close()
 
@@ -163,8 +168,8 @@ func podToSessionInfo(pod *corev1.Pod) SessionInfo {
 
 	// Get volume name from label (this is the PVC name: <node>-<volume>)
 	// Extract just the volume part by removing node prefix
-	pvcName := pod.Labels[LabelVolumeName]
-	nodeName := pod.Labels[LabelNodeName]
+	pvcName := pod.Labels[sgs.LabelVolumeName]
+	nodeName := pod.Labels[sgs.LabelNodeName]
 	if nodeName != "" && strings.HasPrefix(pvcName, nodeName+"-") {
 		info.VolumeName = strings.TrimPrefix(pvcName, nodeName+"-")
 	} else {
@@ -176,14 +181,12 @@ func podToSessionInfo(pod *corev1.Pod) SessionInfo {
 		info.Node = nodeName
 	}
 
-	// Get session number from label and determine type (0=edit, 1+=run)
-	if numStr := pod.Labels[LabelSessionNumber]; numStr != "" {
-		fmt.Sscanf(numStr, "%d", &info.Number)
-	}
-	if info.Number == 0 {
-		info.Type = SessionTypeEdit
-	} else {
+	// Get session mode from label
+	mode := pod.Labels[sgs.LabelSessionMode]
+	if mode == "run" {
 		info.Type = SessionTypeRun
+	} else {
+		info.Type = SessionTypeEdit
 	}
 
 	// Extract command and GPU count from containers
@@ -214,6 +217,10 @@ func podToSessionInfo(pod *corev1.Pod) SessionInfo {
 		// Count GPUs
 		if gpuQty, ok := container.Resources.Limits["nvidia.com/gpu"]; ok {
 			info.GPUs = int(gpuQty.Value())
+		}
+		// Get GPU memory
+		if gpuMemQty, ok := container.Resources.Limits["nvidia.com/gpumem"]; ok {
+			info.GPUMem = gpuMemQty.Value()
 		}
 	}
 

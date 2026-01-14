@@ -3,8 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"github.com/bacchus-snu/sgs-cli/internal/client"
 	"github.com/bacchus-snu/sgs-cli/internal/volume"
@@ -32,19 +30,13 @@ Examples:
 }
 
 var deleteSessionCmd = &cobra.Command{
-	Use:   "session <node>/<volume>[/<number>]",
+	Use:   "session <node>/<volume>",
 	Short: "Delete a session",
 	Long: `Delete a session.
 
-Without session number: Deletes the edit session (session 0).
-With session number: Deletes the specified session.
-
 Examples:
-  # Delete the edit session (session 0)
-  sgs delete session ferrari/os-volume
-
-  # Delete a specific run session
-  sgs delete session ferrari/os-volume/1`,
+  # Delete the session
+  sgs delete session ferrari/os-volume`,
 	Args: cobra.ExactArgs(1),
 	Run:  runDeleteSession,
 }
@@ -73,7 +65,7 @@ func runDeleteVolume(cmd *cobra.Command, args []string) {
 	fmt.Printf("Deleting volume %s/%s...\n", nodeName, volumeName)
 
 	if err := volume.Delete(ctx, k8sClient, nodeName, volumeName); err != nil {
-		exitWithError("failed to delete volume", err)
+		exitWithError("", err)
 	}
 
 	fmt.Printf("Volume %s/%s deleted successfully\n", nodeName, volumeName)
@@ -82,26 +74,10 @@ func runDeleteVolume(cmd *cobra.Command, args []string) {
 func runDeleteSession(cmd *cobra.Command, args []string) {
 	sessionPath := args[0]
 
-	// Parse path: <node>/<volume> or <node>/<volume>/<number>
-	parts := strings.Split(sessionPath, "/")
-	if len(parts) < 2 || len(parts) > 3 {
-		exitWithError("invalid session path format, expected: <node>/<volume> or <node>/<volume>/<number>", nil)
-	}
-
-	nodeName := parts[0]
-	volumeName := parts[1]
-	sessionNumber := 0 // Default to edit session
-
-	if len(parts) == 3 {
-		var err error
-		sessionNumber, err = strconv.Atoi(parts[2])
-		if err != nil {
-			exitWithError("invalid session number", err)
-		}
-	}
-
-	if nodeName == "" || volumeName == "" {
-		exitWithError("invalid session path format, expected: <node>/<volume> or <node>/<volume>/<number>", nil)
+	// Parse path: <node>/<volume>
+	nodeName, volumeName, err := volume.ParseVolumePath(sessionPath)
+	if err != nil {
+		exitWithError("invalid session path format, expected: <node>/<volume>", nil)
 	}
 
 	ctx := context.Background()
@@ -111,16 +87,21 @@ func runDeleteSession(cmd *cobra.Command, args []string) {
 		exitWithError("failed to create client", err)
 	}
 
-	sessionType := "edit"
-	if sessionNumber > 0 {
-		sessionType = "run"
+	// Check if session exists
+	mode, err := volume.GetSessionMode(ctx, k8sClient, nodeName, volumeName)
+	if err != nil {
+		exitWithError("", err)
 	}
 
-	fmt.Printf("Deleting %s session %d for %s/%s...\n", sessionType, sessionNumber, nodeName, volumeName)
-
-	if err := volume.StopSession(ctx, k8sClient, nodeName, volumeName, sessionNumber); err != nil {
-		exitWithError("failed to delete session", err)
+	if mode == "" {
+		exitWithError(fmt.Sprintf("no session found for %s/%s", nodeName, volumeName), nil)
 	}
 
-	fmt.Printf("Session %s/%s/%d deleted successfully\n", nodeName, volumeName, sessionNumber)
+	fmt.Printf("Deleting %s session for %s/%s...\n", mode, nodeName, volumeName)
+
+	if err := volume.StopSession(ctx, k8sClient, nodeName, volumeName); err != nil {
+		exitWithError("", err)
+	}
+
+	fmt.Printf("Session %s/%s deleted successfully\n", nodeName, volumeName)
 }

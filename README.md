@@ -19,18 +19,35 @@ sgs-cli/
 │   └── sgs/              # Application entry point
 │       └── main.go
 ├── internal/             # Private application code
-│   ├── client/           # Kubernetes client
-│   ├── cmd/              # CLI commands
+│   ├── cleanup/          # Interrupt handling and cleanup registry
+│   ├── client/           # Kubernetes client with retry logic
+│   ├── cmd/              # CLI commands (Cobra)
 │   ├── node/             # Node operations
 │   ├── session/          # Session operations
-│   ├── user/             # User operations
-│   ├── volume/           # Volume operations
+│   ├── sgs/              # Shared configuration and constants
+│   ├── user/             # User identity from OIDC tokens
+│   ├── volume/           # Volume and session management
 │   └── workspace/        # Workspace operations
+├── constants.yaml        # Configuration constants (downloaded by fetch)
 ├── go.mod
 ├── go.sum
 ├── Makefile
 └── README.md
 ```
+
+## Configuration
+
+SGS CLI downloads configuration files to `~/.sgs/` on first run or when `sgs fetch` is executed:
+
+- `~/.sgs/config.yaml` - Kubernetes kubeconfig for cluster access
+- `~/.sgs/constants.yaml` - Configuration constants (labels, annotations, defaults)
+- `~/.sgs/cache/` - Token cache for OIDC authentication
+
+The `constants.yaml` file is downloaded from this repository and contains configurable values like:
+
+- Kubernetes label and annotation keys
+- Default container images and resource limits
+- Runtime class configuration
 
 ## Prerequisites
 
@@ -108,6 +125,9 @@ sgs create volume ferrari/os-volume --image pytorch/pytorch:2.0.0-cuda11.7-cudnn
 
 # Create a data volume (storage only)
 sgs create volume ferrari/data-vol --size 100Gi
+
+# Copy a volume (same or different node)
+sgs cp ferrari/os-volume porsche/os-volume
 
 # Delete a volume
 sgs delete volume ferrari/os-volume

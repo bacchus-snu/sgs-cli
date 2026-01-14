@@ -1,25 +1,32 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/bacchus-snu/sgs-cli/internal/cleanup"
 	"github.com/bacchus-snu/sgs-cli/internal/client"
 	"github.com/bacchus-snu/sgs-cli/internal/volume"
 	"github.com/spf13/cobra"
 )
 
-
 var (
-	createSize    string
-	createImage   string
-	sessionGPUs   int
-	sessionCmd    []string
-	sessionMounts []string
+	createSize  string
+	createImage string
+
+	// Session flags
+	sessionRunMode bool  // --run flag
+	sessionGPUNum  int   // --gpu-num flag
+	sessionGPUMem  int64 // --gpu-mem flag (MiB)
+	sessionPinCPU  int64 // --pin-cpu flag (cores)
+	sessionPinMem  int64 // --pin-mem flag (bytes)
+	sessionCmd     []string
+	sessionMounts  []string
+	sessionAttach  bool // --attach flag
 )
 
 var createCmd = &cobra.Command{
@@ -40,7 +47,7 @@ The volume name format is: <node-name>/<volume-name>
 
 The --image flag can be used in two ways:
   - --image <custom-image>: Use a specific container image
-  - --image (without value): Use the default image (nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04)
+  - --image (without value): Use the default image (nvidia/cuda:12.5.0-base-ubuntu22.04)
 
 Examples:
   # Create an OS volume with default image
@@ -59,35 +66,41 @@ Examples:
 }
 
 var createSessionCmd = &cobra.Command{
-	Use:   "session <node>/<volume>[/<number>]",
+	Use:   "session <node>/<volume>",
 	Short: "Create a session on an OS volume",
 	Long: `Create a session on an OS volume.
 
-Without --gpu flag: Creates an edit session (session 0) for interactive use.
+By default (or with --edit): Creates an edit session for interactive use.
   - Limited resources (4 CPU, 16GiB memory)
-  - Attaches to shell immediately
-  - Only one edit session per volume
-  - Session number is always 0 (cannot be specified)
+  - GPU memory set to 0 (HAMi: drivers accessible, CUDA blocked)
+  - Use --attach to attach to shell immediately
 
-With --gpu flag: Creates a run session for GPU workloads.
-  - Requires --command flag
-  - Session number can be specified (must be >= 1), or auto-assigned
+With --run flag: Creates a run session for GPU workloads.
+  - Requires --gpu-num and --gpu-mem flags
+  - Optional --command flag for batch execution
   - CPU/memory automatically calculated based on GPU count
+  - Use --pin-cpu and --pin-mem to pin resources
 
 You can mount additional volumes using the --mount flag.
 
 Examples:
-  # Start an edit session (session 0)
+  # Start an edit session
   sgs create session ferrari/os-volume
+
+  # Start an edit session and attach immediately
+  sgs create session ferrari/os-volume --attach
 
   # Start an edit session with mounted data volume
   sgs create session ferrari/os-volume --mount ferrari/data-vol:/data
 
-  # Start a run session with 1 GPU (auto-assign session number)
-  sgs create session ferrari/os-volume --gpu 1 --command python train.py
+  # Start a run session with GPU (interactive)
+  sgs create session ferrari/os-volume --run --gpu-num 1 --gpu-mem 8192 --attach
 
-  # Start a run session with specific session number
-  sgs create session ferrari/os-volume/3 --gpu 2 --command "python train.py"`,
+  # Start a run session with batch command
+  sgs create session ferrari/os-volume --run --gpu-num 2 --gpu-mem 16384 --command "python train.py"
+
+  # Start a run session with pinned resources
+  sgs create session ferrari/os-volume --run --gpu-num 1 --gpu-mem 8192 --pin-cpu 8 --pin-mem 34359738368`,
 	Args: cobra.ExactArgs(1),
 	Run:  runCreateSession,
 }
@@ -100,8 +113,13 @@ func init() {
 	createVolumeCmd.Flags().StringVar(&createImage, "image", "", "Container image for OS volume (default: "+volume.DefaultImage+")")
 	createVolumeCmd.Flags().Lookup("image").NoOptDefVal = volume.DefaultImage
 
-	createSessionCmd.Flags().IntVar(&sessionGPUs, "gpu", 0, "Number of GPUs (0 for edit mode, 1+ for run mode)")
-	createSessionCmd.Flags().StringArrayVar(&sessionCmd, "command", nil, "Command to run (required for run mode)")
+	createSessionCmd.Flags().BoolVar(&sessionRunMode, "run", false, "Create a run session (with GPU)")
+	createSessionCmd.Flags().BoolVar(&sessionAttach, "attach", false, "Attach to the session after creation")
+	createSessionCmd.Flags().IntVar(&sessionGPUNum, "gpu-num", 0, "Number of GPUs (required for run mode)")
+	createSessionCmd.Flags().Int64Var(&sessionGPUMem, "gpu-mem", 0, "GPU memory in MiB (required for run mode)")
+	createSessionCmd.Flags().Int64Var(&sessionPinCPU, "pin-cpu", 0, "Pin CPU cores (0 = no pinning)")
+	createSessionCmd.Flags().Int64Var(&sessionPinMem, "pin-mem", 0, "Pin memory in bytes (0 = no pinning)")
+	createSessionCmd.Flags().StringArrayVar(&sessionCmd, "command", nil, "Command to run (for batch execution)")
 	createSessionCmd.Flags().StringArrayVar(&sessionMounts, "mount", nil, "Mount volumes (<node>/<volume>:<path>)")
 }
 
@@ -114,7 +132,9 @@ func runCreateVolume(cmd *cobra.Command, args []string) {
 	nodeName := parts[0]
 	volumeName := parts[1]
 
-	ctx := context.Background()
+	// Use InterruptibleContext for cleanup on interrupt
+	ctx, cancel := cleanup.InterruptibleContext(context.Background())
+	defer cancel()
 
 	k8sClient, err := client.New()
 	if err != nil {
@@ -136,7 +156,7 @@ func runCreateVolume(cmd *cobra.Command, args []string) {
 	fmt.Printf("Creating %s volume %s on %s...\n", volumeType, volumeName, nodeName)
 
 	if err := volume.Create(ctx, k8sClient, opts); err != nil {
-		exitWithError("failed to create volume", err)
+		exitWithError("", err)
 	}
 
 	volumePath := nodeName + "/" + volumeName
@@ -149,26 +169,10 @@ func runCreateVolume(cmd *cobra.Command, args []string) {
 func runCreateSession(cmd *cobra.Command, args []string) {
 	sessionPath := args[0]
 
-	// Parse path: <node>/<volume>[/<number>]
-	parts := strings.Split(sessionPath, "/")
-	if len(parts) < 2 || len(parts) > 3 {
-		exitWithError("invalid session path format, expected: <node>/<volume>[/<number>]", nil)
-	}
-
-	nodeName := parts[0]
-	volumeName := parts[1]
-	sessionNumber := -1 // -1 means auto-assign
-
-	if len(parts) == 3 {
-		var err error
-		sessionNumber, err = strconv.Atoi(parts[2])
-		if err != nil {
-			exitWithError("invalid session number", err)
-		}
-	}
-
-	if nodeName == "" || volumeName == "" {
-		exitWithError("invalid session path format, expected: <node>/<volume>[/<number>]", nil)
+	// Parse path: <node>/<volume>
+	nodeName, volumeName, err := volume.ParseVolumePath(sessionPath)
+	if err != nil {
+		exitWithError("invalid session path format, expected: <node>/<volume>", nil)
 	}
 
 	// Parse mounts
@@ -184,18 +188,77 @@ func runCreateSession(cmd *cobra.Command, args []string) {
 		exitWithError("failed to create client", err)
 	}
 
-	if sessionGPUs == 0 {
-		// Edit mode (session 0)
-		if sessionNumber != -1 && sessionNumber != 0 {
-			exitWithError("edit session (no --gpu) must be session 0", nil)
+	// Check for existing session
+	existingMode, err := volume.GetSessionMode(ctx, k8sClient, nodeName, volumeName)
+	if err != nil {
+		exitWithError("", err)
+	}
+
+	requestedMode := volume.SessionModeEdit
+	if sessionRunMode {
+		requestedMode = volume.SessionModeRun
+	}
+
+	if sessionRunMode {
+		// Run mode validations
+		if sessionGPUNum <= 0 && sessionGPUMem <= 0 {
+			exitWithError("--gpu-num and --gpu-mem are required for run mode", nil)
 		}
-		runEditSession(ctx, k8sClient, nodeName, volumeName, mounts)
+		if sessionGPUNum <= 0 {
+			exitWithError("--gpu-num is required for run mode", nil)
+		}
+		if sessionGPUMem <= 0 {
+			exitWithError("--gpu-mem is required for run mode", nil)
+		}
 	} else {
-		// Run mode (session 1+)
-		if sessionNumber != -1 && sessionNumber < 1 {
-			exitWithError("run session (with --gpu) must have session number >= 1", nil)
+		// Edit mode validations - reject GPU-related flags
+		if sessionGPUNum > 0 {
+			exitWithError("--gpu-num is only valid for run mode (use --run flag)", nil)
 		}
-		runGPUSession(ctx, k8sClient, nodeName, volumeName, sessionGPUs, sessionCmd, mounts, sessionNumber)
+		if sessionGPUMem > 0 {
+			exitWithError("--gpu-mem is only valid for run mode (use --run flag)", nil)
+		}
+		if sessionPinCPU > 0 {
+			exitWithError("--pin-cpu is only valid for run mode (use --run flag)", nil)
+		}
+		if sessionPinMem > 0 {
+			exitWithError("--pin-mem is only valid for run mode (use --run flag)", nil)
+		}
+		if len(sessionCmd) > 0 {
+			exitWithError("--command is only valid for run mode (use --run flag)", nil)
+		}
+	}
+
+	if existingMode != "" {
+		if existingMode == requestedMode {
+			// Same mode - deny
+			exitWithError(fmt.Sprintf("session already exists in %s mode for %s/%s", existingMode, nodeName, volumeName), nil)
+		} else {
+			// Different mode - ask user
+			fmt.Printf("Session exists in %s mode. Close and reopen in %s mode? (y/N): ", existingMode, requestedMode)
+			reader := bufio.NewReader(os.Stdin)
+			response, _ := reader.ReadString('\n')
+			response = strings.TrimSpace(strings.ToLower(response))
+			if response != "y" && response != "yes" {
+				fmt.Println("Aborted.")
+				return
+			}
+			// Delete existing session
+			if err := volume.StopSession(ctx, k8sClient, nodeName, volumeName); err != nil {
+				exitWithError("failed to stop existing session", err)
+			}
+			fmt.Println("Existing session stopped.")
+			// Wait for pod to be deleted
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	if sessionRunMode {
+		// Run mode
+		runGPUSession(ctx, k8sClient, nodeName, volumeName, mounts)
+	} else {
+		// Edit mode (default)
+		runEditSession(ctx, k8sClient, nodeName, volumeName, mounts)
 	}
 }
 
@@ -206,75 +269,78 @@ func runEditSession(ctx context.Context, k8sClient *client.Client, nodeName, vol
 		Mounts:     mounts,
 	}
 
-	fmt.Printf("Starting edit session for %s/%s...\n", nodeName, volumeName)
+	fmt.Printf("Creating edit session for %s/%s...\n", nodeName, volumeName)
 
 	result, err := volume.Edit(ctx, k8sClient, opts)
 	if err != nil {
-		exitWithError("failed to start edit session", err)
+		exitWithError("", err)
 	}
 
 	podName := result.PodName
 
 	if result.Existing {
-		fmt.Println("Reattaching to existing edit session...")
+		fmt.Println("Session already exists, reusing...")
 	}
 
-	// Wait for pod to be ready
-	fmt.Println("Waiting for pod to be ready...")
-	if err := volume.WaitForPodReady(ctx, k8sClient, podName, 5*time.Minute); err != nil {
-		exitWithError("pod failed to become ready", err)
-	}
+	fmt.Printf("Edit session created: %s/%s\n", nodeName, volumeName)
+	fmt.Printf("Use 'sgs attach %s/%s' to attach to the session\n", nodeName, volumeName)
+	fmt.Printf("Use 'sgs delete session %s/%s' to delete\n", nodeName, volumeName)
 
-	fmt.Printf("Attaching to shell (use 'sgs delete session %s/%s' to delete)...\n", nodeName, volumeName)
-
-	// Attach to the pod
-	if err := volume.Attach(ctx, k8sClient, podName, os.Stdin, os.Stdout, os.Stderr); err != nil {
-		exitWithError("failed to attach to pod", err)
-	}
-}
-
-func runGPUSession(ctx context.Context, k8sClient *client.Client, nodeName, volumeName string, gpus int, command []string, mounts []volume.MountOption, requestedNumber int) {
-	opts := volume.RunOptions{
-		NodeName:      nodeName,
-		VolumeName:    volumeName,
-		GPUs:          gpus,
-		Command:       command,
-		Mounts:        mounts,
-		SessionNumber: requestedNumber, // -1 means auto-assign
-	}
-
-	interactive := len(command) == 0
-	if interactive {
-		fmt.Printf("Starting interactive run session with %d GPU(s) on %s/%s...\n", gpus, nodeName, volumeName)
-	} else {
-		fmt.Printf("Starting run session with %d GPU(s) on %s/%s...\n", gpus, nodeName, volumeName)
-	}
-
-	result, err := volume.Run(ctx, k8sClient, opts)
-	if err != nil {
-		exitWithError("failed to start run session", err)
-	}
-
-	podName := result.PodName
-	sessionNum := result.SessionNumber
-
-	if interactive {
+	if sessionAttach {
 		// Wait for pod to be ready and attach
 		fmt.Println("Waiting for pod to be ready...")
 		if err := volume.WaitForPodReady(ctx, k8sClient, podName, 5*time.Minute); err != nil {
 			exitWithError("pod failed to become ready", err)
 		}
 
-		fmt.Printf("Attaching to shell (use 'sgs delete session %s/%s/%d' to delete)...\n", nodeName, volumeName, sessionNum)
-
-		// Attach to the pod
+		fmt.Println("Attaching to session...")
 		if err := volume.Attach(ctx, k8sClient, podName, os.Stdin, os.Stdout, os.Stderr); err != nil {
 			exitWithError("failed to attach to pod", err)
 		}
+	}
+}
+
+func runGPUSession(ctx context.Context, k8sClient *client.Client, nodeName, volumeName string, mounts []volume.MountOption) {
+	opts := volume.RunOptions{
+		NodeName:   nodeName,
+		VolumeName: volumeName,
+		GPUs:       sessionGPUNum,
+		GPUMem:     sessionGPUMem,
+		Command:    sessionCmd,
+		Mounts:     mounts,
+		PinCPU:     sessionPinCPU,
+		PinMem:     sessionPinMem,
+	}
+
+	fmt.Printf("Creating run session with %d GPU(s) and %d MiB GPU memory on %s/%s...\n", sessionGPUNum, sessionGPUMem, nodeName, volumeName)
+
+	result, err := volume.Run(ctx, k8sClient, opts)
+	if err != nil {
+		exitWithError("", err)
+	}
+
+	podName := result.PodName
+
+	fmt.Printf("Run session created: %s/%s\n", nodeName, volumeName)
+
+	if len(sessionCmd) > 0 {
+		fmt.Printf("Use 'sgs logs %s/%s' to view output\n", nodeName, volumeName)
 	} else {
-		fmt.Printf("Run session started: %s/%s/%d\n", nodeName, volumeName, sessionNum)
-		fmt.Printf("Use 'sgs logs %s/%s/%d' to view output\n", nodeName, volumeName, sessionNum)
-		fmt.Printf("Use 'sgs delete session %s/%s/%d' to stop\n", nodeName, volumeName, sessionNum)
+		fmt.Printf("Use 'sgs attach %s/%s' to attach to the session\n", nodeName, volumeName)
+	}
+	fmt.Printf("Use 'sgs delete session %s/%s' to delete\n", nodeName, volumeName)
+
+	if sessionAttach {
+		// Wait for pod to be ready and attach
+		fmt.Println("Waiting for pod to be ready...")
+		if err := volume.WaitForPodReady(ctx, k8sClient, podName, 5*time.Minute); err != nil {
+			exitWithError("pod failed to become ready", err)
+		}
+
+		fmt.Println("Attaching to session...")
+		if err := volume.Attach(ctx, k8sClient, podName, os.Stdin, os.Stdout, os.Stderr); err != nil {
+			exitWithError("failed to attach to pod", err)
+		}
 	}
 }
 

@@ -1,3 +1,4 @@
+// Package volume provides volume and session management for SGS.
 package volume
 
 import (
@@ -5,10 +6,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/bacchus-snu/sgs-cli/internal/cleanup"
 	"github.com/bacchus-snu/sgs-cli/internal/client"
+	"github.com/bacchus-snu/sgs-cli/internal/sgs"
+	"github.com/bacchus-snu/sgs-cli/internal/workspace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -17,25 +23,12 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-const (
-	// Label keys for SGS-managed resources (hardcoded)
-	LabelManagedBy     = "app.kubernetes.io/managed-by"
-	LabelNodeName      = "sgs.bacchus.io/node-name"
-	LabelVolumeName    = "sgs.bacchus.io/volume-name"
-	LabelSessionNumber = "sgs.bacchus.io/session-number"
-
-	// Annotation for selected node (set by k8s storage provisioner)
-	AnnotationSelectedNode = "volume.kubernetes.io/selected-node"
-	// Annotation for OS volume image
-	AnnotationOSImage = "sgs.bacchus.io/os-image"
-
-	// Hardcoded values
-	DefaultImage       = "nvcr.io/nvidia/cuda:12.5.0-base-ubuntu22.04"
-	DefaultStorageSize = "10Gi"
-
-	// Edit mode defaults
-	EditCPULimit    = "4"
-	EditMemoryLimit = "16Gi"
+// Re-export values for backward compatibility.
+// These are initialized to the default values and updated when config is loaded.
+var (
+	SessionModeEdit = "edit"
+	SessionModeRun  = "run"
+	DefaultImage    = "nvcr.io/nvidia/cuda:12.5.0-base-ubuntu22.04"
 )
 
 // VolumeInfo represents information about an SGS volume
@@ -66,12 +59,14 @@ type EditOptions struct {
 
 // RunOptions holds options for running a volume with GPU
 type RunOptions struct {
-	NodeName      string
-	VolumeName    string
-	GPUs          int
-	Command       []string      // Command to run (required)
-	Mounts        []MountOption // Additional volumes to mount
-	SessionNumber int           // Requested session number (-1 for auto-assign)
+	NodeName   string
+	VolumeName string
+	GPUs       int           // Number of GPUs
+	GPUMem     int64         // GPU memory in MiB (HAMi)
+	Command    []string      // Command to run (optional, interactive if empty)
+	Mounts     []MountOption // Additional volumes to mount
+	PinCPU     int64         // Pinned CPU cores (0 = no pinning)
+	PinMem     int64         // Pinned memory in bytes (0 = no pinning)
 }
 
 // MountOption represents a volume mount
@@ -108,29 +103,31 @@ func FormatVolumePath(nodeName, volumeName string) string {
 
 // List returns all volumes (PVCs) in the current namespace
 func List(ctx context.Context, c *client.Client) ([]VolumeInfo, error) {
-	// List ALL PVCs in namespace
-	pvcs, err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).List(ctx, metav1.ListOptions{})
+	// List ALL PVCs in namespace with retry
+	pvcs, err := client.RetryWithContext(ctx, func() (*corev1.PersistentVolumeClaimList, error) {
+		return c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).List(ctx, metav1.ListOptions{})
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list PVCs: %w", err)
+		return nil, client.FormatK8sError(err, "list", "volumes", c.Namespace)
 	}
 
 	var volumes []VolumeInfo
 	for _, pvc := range pvcs.Items {
 		// Get node from selected-node annotation, fallback to label
-		nodeName := pvc.Annotations[AnnotationSelectedNode]
+		nodeName := pvc.Annotations[sgs.AnnotationSelectedNode]
 		if nodeName == "" {
-			nodeName = pvc.Labels[LabelNodeName]
+			nodeName = pvc.Labels[sgs.LabelNodeName]
 		}
 
 		// Get volume name from label (PVC name is <node>-<volume>)
-		volumeName := pvc.Labels[LabelVolumeName]
+		volumeName := pvc.Labels[sgs.LabelVolumeName]
 		if volumeName == "" {
 			// Fallback: try to extract from PVC name (for backwards compatibility)
 			volumeName = pvc.Name
 		}
 
 		// Check if this is an OS volume (has image annotation)
-		osImage := pvc.Annotations[AnnotationOSImage]
+		osImage := pvc.Annotations[sgs.AnnotationOSImage]
 		isOSVolume := osImage != ""
 
 		// Check if there's an init pod (volume is being initialized)
@@ -208,17 +205,21 @@ func ListByNode(ctx context.Context, c *client.Client, nodeName string) ([]Volum
 
 // Get returns information about a specific volume by node and name
 func Get(ctx context.Context, c *client.Client, nodeName, volumeName string) (*VolumeInfo, error) {
-	pvc, err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, pvcName(nodeName, volumeName), metav1.GetOptions{})
+	pvc, err := client.RetryWithContext(ctx, func() (*corev1.PersistentVolumeClaim, error) {
+		return c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, pvcName(nodeName, volumeName), metav1.GetOptions{})
+	})
 	if err != nil {
 		return nil, fmt.Errorf("volume not found: %w", err)
 	}
 
 	// Check if this is an OS volume (has image annotation)
-	osImage := pvc.Annotations[AnnotationOSImage]
+	osImage := pvc.Annotations[sgs.AnnotationOSImage]
 	isOSVolume := osImage != ""
 
 	// Check if there's an associated pod
-	pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, pvcName(nodeName, volumeName), metav1.GetOptions{})
+	pod, err := client.RetryWithContext(ctx, func() (*corev1.Pod, error) {
+		return c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, pvcName(nodeName, volumeName), metav1.GetOptions{})
+	})
 	status := string(pvc.Status.Phase)
 	if err == nil {
 		status = string(pod.Status.Phase)
@@ -246,25 +247,30 @@ func Get(ctx context.Context, c *client.Client, nodeName, volumeName string) (*V
 // If Image is empty, creates a data volume (PVC only, for storage)
 // If Image is set, creates an OS volume (PVC + init pod that copies base files)
 func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
+	// Validate node access before creating anything
+	if err := validateNodeAccess(ctx, c, opts.NodeName); err != nil {
+		return err
+	}
+
 	name := pvcName(opts.NodeName, opts.VolumeName)
 
 	// Set defaults
 	if opts.Size == "" {
-		opts.Size = DefaultStorageSize
+		opts.Size = sgs.DefaultStorageSize
 	}
 
 	// Create labels
 	labels := map[string]string{
-		LabelManagedBy:  "sgs",
-		LabelNodeName:   opts.NodeName,
-		LabelVolumeName: opts.VolumeName,
+		sgs.LabelManagedBy:  "sgs",
+		sgs.LabelNodeName:   opts.NodeName,
+		sgs.LabelVolumeName: opts.VolumeName,
 	}
 
 	// Create annotations
 	annotations := make(map[string]string)
 	if opts.Image != "" {
 		// OS volume - store image in annotation
-		annotations[AnnotationOSImage] = opts.Image
+		annotations[sgs.AnnotationOSImage] = opts.Image
 	}
 
 	// Create PVC
@@ -289,29 +295,59 @@ func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 
 	_, err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to create PVC: %w", err)
+		return client.FormatK8sError(err, "create", "volume", c.Namespace)
 	}
 
 	// For OS volumes, create an init pod to bind PVC and copy base files
 	if opts.Image != "" {
+		// Register cleanup for PVC in case of interrupt during init
+		cleanup.Register(func(cleanupCtx context.Context) {
+			fmt.Fprint(os.Stderr, "Cleaning up volume...")
+			if err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(cleanupCtx, name, metav1.DeleteOptions{}); err != nil {
+				fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+			} else {
+				fmt.Fprintln(os.Stderr, " done")
+			}
+		})
+
 		initPod := createInitPodSpec(name, opts.NodeName, opts.Image, c.Namespace)
 		podName := initPod.Name
 		_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, initPod, metav1.CreateOptions{})
 		if err != nil {
 			// Cleanup PVC if pod creation fails
+			cleanup.Unregister()
 			_ = c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-			return fmt.Errorf("failed to create init pod: %w", err)
+			return client.FormatK8sError(err, "create", "volume initialization", c.Namespace)
 		}
+
+		// Register cleanup for init pod
+		cleanup.Register(func(cleanupCtx context.Context) {
+			fmt.Fprint(os.Stderr, "Cleaning up init pod...")
+			if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{}); err != nil {
+				fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+			} else {
+				fmt.Fprintln(os.Stderr, " done")
+			}
+		})
 
 		// Wait for init pod to complete or fail
 		if err := waitForInitPod(ctx, c, podName, 5*time.Minute); err != nil {
+			// If interrupted, signal handler does cleanup - just wait and return
+			if cleanup.WasInterrupted() {
+				cleanup.WaitForCleanup()
+				return nil
+			}
 			// Cleanup on failure
+			cleanup.Unregister() // init pod
+			cleanup.Unregister() // PVC
 			_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 			_ = c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 			return fmt.Errorf("init failed: %w", err)
 		}
 
-		// Delete init pod after successful completion
+		// Success - unregister cleanups and delete init pod
+		cleanup.Unregister() // init pod
+		cleanup.Unregister() // PVC
 		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	}
 
@@ -373,7 +409,7 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 			Name:      podName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				LabelManagedBy:        "sgs",
+				sgs.LabelManagedBy:    "sgs",
 				"sgs.bacchus.io/mode": "init",
 			},
 		},
@@ -391,8 +427,8 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 							corev1.ResourceMemory: resource.MustParse("0"),
 						},
 						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse(EditCPULimit),
-							corev1.ResourceMemory: resource.MustParse(EditMemoryLimit),
+							corev1.ResourceCPU:    resource.MustParse(sgs.EditCPULimit),
+							corev1.ResourceMemory: resource.MustParse(sgs.EditMemoryLimit),
 						},
 					},
 					VolumeMounts: []corev1.VolumeMount{
@@ -451,14 +487,14 @@ func GetPVCInfo(ctx context.Context, c *client.Client, nodeName, volumeName stri
 	if err != nil {
 		return "", fmt.Errorf("volume not found: %w", err)
 	}
-	return pvc.Annotations[AnnotationOSImage], nil
+	return pvc.Annotations[sgs.AnnotationOSImage], nil
 }
 
 // GetNodeResources returns total CPU cores, memory bytes, and GPU count for a node
 func GetNodeResources(ctx context.Context, c *client.Client, nodeName string) (cpuCores int64, memoryBytes int64, gpuCount int64, err error) {
 	node, err := c.Clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to get node: %w", err)
+		return 0, 0, 0, client.FormatK8sError(err, "get", "node", "cluster")
 	}
 
 	allocatable := node.Status.Allocatable
@@ -472,27 +508,43 @@ func GetNodeResources(ctx context.Context, c *client.Client, nodeName string) (c
 }
 
 // sessionPodName returns the pod name for a session
-// Format: <node>-<volume>-<number>
-// Session 0 is edit mode, sessions 1+ are run mode
-func sessionPodName(nodeName, volumeName string, number int) string {
-	return fmt.Sprintf("%s-%s-%d", nodeName, volumeName, number)
+// Format: <node>-<volume> (one session per volume)
+func sessionPodName(nodeName, volumeName string) string {
+	return fmt.Sprintf("%s-%s", nodeName, volumeName)
 }
 
-// findNextRunSessionNumber finds the next available number for run mode (starting from 1)
-func findNextRunSessionNumber(ctx context.Context, c *client.Client, nodeName, volumeName string) (int, error) {
-	// Run sessions start from 1 (0 is edit session)
-	for i := 1; i < 1000; i++ {
-		name := sessionPodName(nodeName, volumeName, i)
-		_, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, name, metav1.GetOptions{})
+// GetSessionMode returns the mode of an existing session, or empty string if no session exists
+func GetSessionMode(ctx context.Context, c *client.Client, nodeName, volumeName string) (string, error) {
+	podName := sessionPodName(nodeName, volumeName)
+	pod, err := client.RetryWithContext(ctx, func() (*corev1.Pod, error) {
+		return c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	})
+	if err != nil {
 		if errors.IsNotFound(err) {
-			return i, nil
+			return "", nil // No session exists
 		}
-		if err != nil {
-			return 0, fmt.Errorf("failed to check pod: %w", err)
-		}
+		return "", client.FormatK8sError(err, "check", "session", c.Namespace)
 	}
 
-	return 0, fmt.Errorf("too many run sessions for volume %s/%s", nodeName, volumeName)
+	// Check if pod is still active
+	if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return "", nil // Session is terminated
+	}
+
+	// Get mode from label, with fallback for backwards compatibility
+	mode := pod.Labels[sgs.LabelSessionMode]
+	if mode == "" {
+		// Old pods without the mode label - determine mode from other indicators
+		// If it has GPU resources, it's a run session; otherwise edit
+		for _, container := range pod.Spec.Containers {
+			if gpuLimit, ok := container.Resources.Limits["nvidia.com/gpu"]; ok && !gpuLimit.IsZero() {
+				return SessionModeRun, nil
+			}
+		}
+		return SessionModeEdit, nil
+	}
+
+	return mode, nil
 }
 
 // EditResult contains the result of starting an edit session
@@ -503,14 +555,18 @@ type EditResult struct {
 
 // RunResult contains the result of starting a run session
 type RunResult struct {
-	PodName       string
-	SessionNumber int
+	PodName string
 }
 
 // Edit starts an edit session for an OS volume (no GPU, limited CPU/memory)
 // Returns the pod name and whether it's an existing session
 func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult, error) {
-	podName := sessionPodName(opts.NodeName, opts.VolumeName, 0)
+	// Validate node access
+	if err := validateNodeAccess(ctx, c, opts.NodeName); err != nil {
+		return nil, err
+	}
+
+	podName := sessionPodName(opts.NodeName, opts.VolumeName)
 	pvc := pvcName(opts.NodeName, opts.VolumeName)
 
 	// Get PVC info
@@ -524,7 +580,7 @@ func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult,
 		return nil, fmt.Errorf("cannot edit: '%s/%s' is not an OS volume (no image configured)", opts.NodeName, opts.VolumeName)
 	}
 
-	// Check if edit pod already exists
+	// Check if pod already exists
 	existingPod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err == nil {
 		// Pod exists - check if it's still usable
@@ -533,12 +589,12 @@ func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult,
 		}
 		// Pod exists but is terminated - delete it first
 		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
-			return nil, fmt.Errorf("failed to cleanup terminated edit pod: %w", err)
+			return nil, fmt.Errorf("failed to cleanup terminated pod: %w", err)
 		}
 		// Wait a moment for deletion
 		time.Sleep(time.Second)
 	} else if !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("failed to check existing pod: %w", err)
+		return nil, client.FormatK8sError(err, "check", "session", c.Namespace)
 	}
 
 	// Create pod with edit mode resources
@@ -546,15 +602,21 @@ func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult,
 
 	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Pod: %w", err)
+		return nil, client.FormatK8sError(err, "create", "session", c.Namespace)
 	}
 
 	return &EditResult{PodName: podName, Existing: false}, nil
 }
 
 // Run starts a GPU session for an OS volume
-// Returns the run result with pod name and session number
+// Returns the run result with pod name
 func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, error) {
+	// Validate node access
+	if err := validateNodeAccess(ctx, c, opts.NodeName); err != nil {
+		return nil, err
+	}
+
+	podName := sessionPodName(opts.NodeName, opts.VolumeName)
 	pvc := pvcName(opts.NodeName, opts.VolumeName)
 
 	// Get PVC info
@@ -568,19 +630,22 @@ func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, er
 		return nil, fmt.Errorf("cannot run: '%s/%s' is not an OS volume (no image configured)", opts.NodeName, opts.VolumeName)
 	}
 
-	// Determine session number
-	var sessionNumber int
-	if opts.SessionNumber >= 1 {
-		// Use requested session number
-		sessionNumber = opts.SessionNumber
-	} else {
-		// Auto-assign: find next available session number (run sessions start from 1)
-		sessionNumber, err = findNextRunSessionNumber(ctx, c, opts.NodeName, opts.VolumeName)
-		if err != nil {
-			return nil, err
+	// Check if pod already exists
+	existingPod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err == nil {
+		// Pod exists - check if it's still usable
+		if existingPod.Status.Phase == corev1.PodRunning || existingPod.Status.Phase == corev1.PodPending {
+			return &RunResult{PodName: podName}, nil
 		}
+		// Pod exists but is terminated - delete it first
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{}); err != nil {
+			return nil, client.FormatK8sError(err, "cleanup", "session", c.Namespace)
+		}
+		// Wait a moment for deletion
+		time.Sleep(time.Second)
+	} else if !errors.IsNotFound(err) {
+		return nil, client.FormatK8sError(err, "check", "session", c.Namespace)
 	}
-	podName := sessionPodName(opts.NodeName, opts.VolumeName, sessionNumber)
 
 	// Get node resources to calculate CPU/memory limits
 	totalCPU, totalMemory, totalGPU, err := GetNodeResources(ctx, c, opts.NodeName)
@@ -598,29 +663,43 @@ func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, er
 	cpuLimit := (7 * totalCPU * int64(opts.GPUs)) / (8 * totalGPU)
 	memLimit := (7 * totalMemory * int64(opts.GPUs)) / (8 * totalGPU)
 
+	// Apply pinning if requested (request = limit when pinned)
+	cpuRequest := int64(0)
+	memRequest := int64(0)
+	if opts.PinCPU > 0 {
+		cpuLimit = opts.PinCPU
+		cpuRequest = opts.PinCPU
+	}
+	if opts.PinMem > 0 {
+		memLimit = opts.PinMem
+		memRequest = opts.PinMem
+	}
+
 	// Create pod with GPU resources
-	pod := createRunPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, sessionNumber, opts.GPUs, cpuLimit, memLimit, opts.Command, opts.Mounts, c.Namespace)
+	pod := createRunPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, opts.GPUs, opts.GPUMem, cpuLimit, memLimit, cpuRequest, memRequest, opts.Command, opts.Mounts, c.Namespace)
 
 	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Pod: %w", err)
+		return nil, client.FormatK8sError(err, "create", "session", c.Namespace)
 	}
 
-	return &RunResult{PodName: podName, SessionNumber: sessionNumber}, nil
+	return &RunResult{PodName: podName}, nil
 }
 
 // createEditPodSpec creates a pod for edit mode (no GPU, limited resources)
+// Uses SGS RuntimeClass which swaps the container rootfs to the PVC via sgs-runc-wrapper
 func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mounts []MountOption, namespace string) *corev1.Pod {
 	// Build volume mounts and volumes
+	// The boot-volume mount is a "beacon" - sgs-runc-wrapper uses its source as the new Root.Path
 	volumeMounts := []corev1.VolumeMount{
 		{
-			Name:      "rootfs-storage",
-			MountPath: "/persistent_root",
+			Name:      "boot-volume",
+			MountPath: "/var/lib/sgs/boot",
 		},
 	}
 	volumes := []corev1.Volume{
 		{
-			Name: "rootfs-storage",
+			Name: "boot-volume",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: pvcName,
@@ -646,24 +725,31 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 		})
 	}
 
+	runtimeClassName := "sgs"
+
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				LabelManagedBy:     "sgs",
-				LabelVolumeName:    pvcName,
-				LabelNodeName:      nodeName,
-				LabelSessionNumber: "0",
+				sgs.LabelManagedBy:   "sgs",
+				sgs.LabelVolumeName:  pvcName,
+				sgs.LabelNodeName:    nodeName,
+				sgs.LabelSessionMode: SessionModeEdit,
+			},
+			Annotations: map[string]string{
+				// Triggers sgs-runc-wrapper to swap Root.Path to this PVC
+				sgs.AnnotationOSVolume: pvcName,
 			},
 		},
 		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClassName,
 			NodeSelector: map[string]string{
 				"kubernetes.io/hostname": nodeName,
 			},
 			Containers: []corev1.Container{
 				{
-					Name:  "work-node",
+					Name:  "main",
 					Image: image,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
@@ -671,13 +757,14 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 							corev1.ResourceMemory: resource.MustParse("0"),
 						},
 						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse(EditCPULimit),
-							corev1.ResourceMemory: resource.MustParse(EditMemoryLimit),
+							corev1.ResourceCPU:                       resource.MustParse(sgs.EditCPULimit),
+							corev1.ResourceMemory:                    resource.MustParse(sgs.EditMemoryLimit),
+							corev1.ResourceName("nvidia.com/gpu"):    resource.MustParse("1"),
+							corev1.ResourceName("nvidia.com/gpumem"): resource.MustParse("0"),
 						},
 					},
 					VolumeMounts: volumeMounts,
-					Command:      []string{"/bin/bash", "-c"},
-					Args:         []string{getInitScript()},
+					Command:      []string{"/bin/sh"},
 					Stdin:        true,
 					TTY:          true,
 				},
@@ -689,17 +776,19 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 }
 
 // createRunPodSpec creates a pod for run mode (with GPU)
-func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sessionNumber, gpus int, cpuLimit, memLimit int64, command []string, mounts []MountOption, namespace string) *corev1.Pod {
+// Uses SGS RuntimeClass which swaps the container rootfs to the PVC via sgs-runc-wrapper
+func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus int, gpuMem int64, cpuLimit, memLimit, cpuRequest, memRequest int64, command []string, mounts []MountOption, namespace string) *corev1.Pod {
 	// Build volume mounts and volumes
-	volumeMount := []corev1.VolumeMount{
+	// The boot-volume mount is a "beacon" - sgs-runc-wrapper uses its source as the new Root.Path
+	volumeMounts := []corev1.VolumeMount{
 		{
-			Name:      "rootfs-storage",
-			MountPath: "/persistent_root",
+			Name:      "boot-volume",
+			MountPath: "/var/lib/sgs/boot",
 		},
 	}
 	volumes := []corev1.Volume{
 		{
-			Name: "rootfs-storage",
+			Name: "boot-volume",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: pvcName,
@@ -711,7 +800,7 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sess
 	// Add additional mounts
 	for i, m := range mounts {
 		volName := fmt.Sprintf("mount-%d", i)
-		volumeMount = append(volumeMount, corev1.VolumeMount{
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      volName,
 			MountPath: m.MountPath,
 		})
@@ -727,50 +816,55 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sess
 
 	// Determine if this is interactive mode (no command) or batch mode (with command)
 	interactive := len(command) == 0
-	var initScript string
-	if interactive {
-		initScript = getInitScript() // Same as edit mode - interactive shell
-	} else {
-		initScript = getRunInitScript(command)
-	}
 
 	container := corev1.Container{
-		Name:  "work-node",
+		Name:  "main",
 		Image: image,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("0"),
-				corev1.ResourceMemory: resource.MustParse("0"),
+				corev1.ResourceCPU:    *resource.NewQuantity(cpuRequest, resource.DecimalSI),
+				corev1.ResourceMemory: *resource.NewQuantity(memRequest, resource.BinarySI),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:                    *resource.NewQuantity(cpuLimit, resource.DecimalSI),
-				corev1.ResourceMemory:                 *resource.NewQuantity(memLimit, resource.BinarySI),
-				corev1.ResourceName("nvidia.com/gpu"): resource.MustParse(fmt.Sprintf("%d", gpus)),
+				corev1.ResourceCPU:                       *resource.NewQuantity(cpuLimit, resource.DecimalSI),
+				corev1.ResourceMemory:                    *resource.NewQuantity(memLimit, resource.BinarySI),
+				corev1.ResourceName("nvidia.com/gpu"):    resource.MustParse(fmt.Sprintf("%d", gpus)),
+				corev1.ResourceName("nvidia.com/gpumem"): *resource.NewQuantity(gpuMem, resource.DecimalSI),
 			},
 		},
-		VolumeMounts: volumeMount,
-		Command:      []string{"/bin/bash", "-c"},
-		Args:         []string{initScript},
+		VolumeMounts: volumeMounts,
 	}
 
-	// Enable TTY and Stdin for interactive mode
 	if interactive {
+		// Interactive mode - shell
+		container.Command = []string{"/bin/sh"}
 		container.Stdin = true
 		container.TTY = true
+	} else {
+		// Batch mode - execute user command
+		container.Command = []string{"/bin/sh", "-c"}
+		container.Args = []string{strings.Join(command, " ")}
 	}
+
+	runtimeClassName := "sgs"
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				LabelManagedBy:     "sgs",
-				LabelVolumeName:    pvcName,
-				LabelNodeName:      nodeName,
-				LabelSessionNumber: fmt.Sprintf("%d", sessionNumber),
+				sgs.LabelManagedBy:   "sgs",
+				sgs.LabelVolumeName:  pvcName,
+				sgs.LabelNodeName:    nodeName,
+				sgs.LabelSessionMode: SessionModeRun,
+			},
+			Annotations: map[string]string{
+				// Triggers sgs-runc-wrapper to swap Root.Path to this PVC
+				sgs.AnnotationOSVolume: pvcName,
 			},
 		},
 		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClassName,
 			NodeSelector: map[string]string{
 				"kubernetes.io/hostname": nodeName,
 			},
@@ -781,191 +875,16 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, sess
 	}
 }
 
-// getInitScript returns the initialization script for edit mode (keeps running)
-// Uses proot for user-space chroot that doesn't require privileges
-func getInitScript() string {
-	return `set -e
-TARGET="/persistent_root"
-
-# Install proot if not available
-if ! command -v proot &> /dev/null; then
-  apt-get update && apt-get install -y proot
-fi
-
-# Create proot entry script for easy access
-cat > /usr/local/bin/proot-shell << 'SCRIPT'
-#!/bin/bash
-TARGET="/persistent_root"
-PROOT_BINDS=""
-for bin in /usr/bin/nvidia-*; do
-  [ -f "$bin" ] && PROOT_BINDS="$PROOT_BINDS -b $bin"
-done
-for lib in /usr/lib/x86_64-linux-gnu/lib{nvidia,cuda}*.so*; do
-  [ -f "$lib" ] && PROOT_BINDS="$PROOT_BINDS -b $lib"
-done
-exec proot -r "$TARGET" \
-  -b /dev -b /dev/shm -b /proc -b /sys \
-  -b /etc/hosts -b /etc/resolv.conf -b /etc/nsswitch.conf \
-  -b /etc/ssl/certs -b /usr/share/ca-certificates \
-  -b /run/nvidia-persistenced \
-  -b /usr/lib/firmware/nvidia \
-  $PROOT_BINDS \
-  -w /root /bin/bash "$@"
-SCRIPT
-chmod +x /usr/local/bin/proot-shell
-
-# Initialize persistent rootfs (first run only)
-if [ ! -d "$TARGET/usr" ]; then
-  echo "Initializing persistent rootfs..."
-
-  # Install debug tools before copying
-  apt-get update && apt-get install -y \
-    curl wget iputils-ping net-tools dnsutils \
-    vim less htop python3 python3-pip
-
-  for dir in bin etc lib lib64 sbin usr var opt root home tmp; do
-    [ -d "/$dir" ] && cp -a "/$dir" "$TARGET/"
-  done
-  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys"
-  mkdir -p "$TARGET/run/nvidia-persistenced"
-  mkdir -p "$TARGET/tmp/vgpulock"
-  chmod 1777 "$TARGET/tmp"
-
-  # Disable apt sandbox for proot compatibility
-  echo 'APT::Sandbox::User "root";' > "$TARGET/etc/apt/apt.conf.d/99sandbox-off"
-fi
-
-# Save environment for proot session
-export -p > "$TARGET/tmp/orig_env.sh"
-
-# Build proot bind options for NVIDIA binaries and libraries
-PROOT_BINDS=""
-for bin in /usr/bin/nvidia-*; do
-  [ -f "$bin" ] && PROOT_BINDS="$PROOT_BINDS -b $bin"
-done
-for lib in /usr/lib/x86_64-linux-gnu/lib{nvidia,cuda}*.so*; do
-  [ -f "$lib" ] && PROOT_BINDS="$PROOT_BINDS -b $lib"
-done
-
-# Enter persistent rootfs with proot (no root privilege required)
-exec proot \
-  -r "$TARGET" \
-  -b /dev \
-  -b /dev/shm \
-  -b /proc \
-  -b /sys \
-  -b /etc/hosts \
-  -b /etc/resolv.conf \
-  -b /etc/nsswitch.conf \
-  -b /etc/ssl/certs \
-  -b /usr/share/ca-certificates \
-  -b /run/nvidia-persistenced \
-  -b /usr/lib/firmware/nvidia \
-  $PROOT_BINDS \
-  -w /root \
-  /bin/bash`
-}
-
-// getRunInitScript returns the initialization script for run mode (executes command then exits)
-// Uses proot for user-space chroot that doesn't require privileges
-func getRunInitScript(command []string) string {
-	// Escape the command for shell
-	escapedCmd := ""
-	for i, arg := range command {
-		if i > 0 {
-			escapedCmd += " "
-		}
-		// Simple escaping: wrap in single quotes and escape existing single quotes
-		escapedCmd += "'" + escapeShellArg(arg) + "'"
-	}
-
-	return fmt.Sprintf(`set -e
-TARGET="/persistent_root"
-
-# Install proot if not available
-if ! command -v proot &> /dev/null; then
-  apt-get update && apt-get install -y proot
-fi
-
-# Initialize persistent rootfs (first run only)
-if [ ! -d "$TARGET/usr" ]; then
-  echo "Initializing persistent rootfs..."
-
-  # Install debug tools before copying
-  apt-get update && apt-get install -y \
-    curl wget iputils-ping net-tools dnsutils \
-    vim less htop python3 python3-pip
-
-  for dir in bin boot etc home lib lib64 media mnt opt root sbin srv tmp usr var; do
-    [ -d "/$dir" ] && cp -a "/$dir" "$TARGET/"
-  done
-  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys"
-  mkdir -p "$TARGET/run/nvidia-persistenced"
-  mkdir -p "$TARGET/tmp/vgpulock"
-  chmod 1777 "$TARGET/tmp"
-
-  # Disable apt sandbox for proot compatibility
-  echo 'APT::Sandbox::User "root";' > "$TARGET/etc/apt/apt.conf.d/99sandbox-off"
-fi
-
-# Save environment for proot session
-export -p > "$TARGET/tmp/orig_env.sh"
-
-# Build proot bind options for NVIDIA binaries and libraries
-PROOT_BINDS=""
-for bin in /usr/bin/nvidia-*; do
-  [ -f "$bin" ] && PROOT_BINDS="$PROOT_BINDS -b $bin"
-done
-for lib in /usr/lib/x86_64-linux-gnu/lib{nvidia,cuda}*.so*; do
-  [ -f "$lib" ] && PROOT_BINDS="$PROOT_BINDS -b $lib"
-done
-
-# Enter persistent rootfs with proot and execute the user command
-exec proot \
-  -r "$TARGET" \
-  -b /dev \
-  -b /dev/shm \
-  -b /proc \
-  -b /sys \
-  -b /etc/hosts \
-  -b /etc/resolv.conf \
-  -b /etc/nsswitch.conf \
-  -b /etc/ssl/certs \
-  -b /usr/share/ca-certificates \
-  -b /run/nvidia-persistenced \
-  -b /usr/lib/firmware/nvidia \
-  $PROOT_BINDS \
-  -w /root \
-  /bin/bash -c "
-    source /tmp/orig_env.sh 2>/dev/null || true
-    ldconfig 2>/dev/null || true
-    %s
-  "`, escapedCmd)
-}
-
-// escapeShellArg escapes single quotes in a shell argument
-func escapeShellArg(s string) string {
-	result := ""
-	for _, c := range s {
-		if c == '\'' {
-			result += "'\"'\"'"
-		} else {
-			result += string(c)
-		}
-	}
-	return result
-}
-
 // StopSession stops a session by deleting the pod
-func StopSession(ctx context.Context, c *client.Client, nodeName, volumeName string, sessionNumber int) error {
-	podName := sessionPodName(nodeName, volumeName, sessionNumber)
+func StopSession(ctx context.Context, c *client.Client, nodeName, volumeName string) error {
+	podName := sessionPodName(nodeName, volumeName)
 
 	err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return fmt.Errorf("no session %d found for volume '%s/%s'", sessionNumber, nodeName, volumeName)
+			return fmt.Errorf("no session found for volume %q", nodeName+"/"+volumeName)
 		}
-		return fmt.Errorf("failed to stop session: %w", err)
+		return client.FormatK8sError(err, "stop", "session", c.Namespace)
 	}
 
 	return nil
@@ -977,37 +896,31 @@ func Stop(ctx context.Context, c *client.Client, podName string) error {
 	err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return fmt.Errorf("no running session found: pod '%s' not found", podName)
+			return fmt.Errorf("session %q not found", podName)
 		}
-		return fmt.Errorf("failed to stop session: %w", err)
+		return client.FormatK8sError(err, "stop", "session", c.Namespace)
 	}
 
 	return nil
 }
 
-// Delete deletes a volume (Pod + PVC)
+// Delete deletes a volume (PVC only, session must be deleted first)
 func Delete(ctx context.Context, c *client.Client, nodeName, volumeName string) error {
 	name := pvcName(nodeName, volumeName)
 
-	// Delete all session pods (0 is edit, 1+ are run)
-	for i := 0; i < 100; i++ {
-		podName := sessionPodName(nodeName, volumeName, i)
-		err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
-		if errors.IsNotFound(err) {
-			if i > 0 {
-				break // No more run sessions
-			}
-			continue // Session 0 might not exist, continue checking
-		}
-		if err != nil {
-			return fmt.Errorf("failed to delete session Pod: %w", err)
-		}
+	// Check if there's an active session - if so, block deletion
+	mode, err := GetSessionMode(ctx, c, nodeName, volumeName)
+	if err != nil {
+		return client.FormatK8sError(err, "check", "session status", c.Namespace)
+	}
+	if mode != "" {
+		return fmt.Errorf("cannot delete volume: active %s session exists. Delete the session first with: sgs delete session %s/%s", mode, nodeName, volumeName)
 	}
 
 	// Delete PVC
 	pvcErr := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if pvcErr != nil && !errors.IsNotFound(pvcErr) {
-		return fmt.Errorf("failed to delete PVC: %w", pvcErr)
+		return client.FormatK8sError(pvcErr, "delete", "volume", c.Namespace)
 	}
 
 	return nil
@@ -1102,5 +1015,578 @@ func Attach(ctx context.Context, c *client.Client, podName string, stdin io.Read
 		Stdout: stdout,
 		Stderr: stderr,
 		Tty:    true,
+	})
+}
+
+// CopyOptions holds options for copying a volume
+type CopyOptions struct {
+	SrcNode   string
+	SrcVolume string
+	DstNode   string
+	DstVolume string
+}
+
+// validateNodeAccess checks if the current workspace can access a specific node
+func validateNodeAccess(ctx context.Context, c *client.Client, nodeName string) error {
+	// Get current workspace info
+	wsInfo, err := workspace.GetCurrent(ctx, c)
+	if err != nil {
+		return fmt.Errorf("failed to get workspace info: %w", err)
+	}
+
+	// Get destination node info
+	node, err := c.Clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("node %s not found", nodeName)
+	}
+
+	// Get node's group label
+	nodeGroup := node.Labels["node-restriction.kubernetes.io/nodegroup"]
+
+	// Check access
+	if !workspace.CanAccessNode(wsInfo.NodeGroup, nodeGroup) {
+		return fmt.Errorf("workspace %q (node group: %s) cannot access node %q (node group: %s)",
+			wsInfo.Name, wsInfo.NodeGroup, nodeName, nodeGroup)
+	}
+
+	return nil
+}
+
+// Copy copies contents from source volume to destination volume.
+// The destination volume is created automatically with the same size and type as source.
+// For same-node copies, uses a single pod. For cross-node copies, streams via tar.
+func Copy(ctx context.Context, c *client.Client, opts CopyOptions) error {
+	// Validate destination node is accessible from current workspace
+	if err := validateNodeAccess(ctx, c, opts.DstNode); err != nil {
+		return err
+	}
+
+	// Validate source volume exists
+	srcInfo, err := Get(ctx, c, opts.SrcNode, opts.SrcVolume)
+	if err != nil {
+		return fmt.Errorf("source volume %s/%s not found", opts.SrcNode, opts.SrcVolume)
+	}
+
+	// Check if source has an active session
+	srcMode, err := GetSessionMode(ctx, c, opts.SrcNode, opts.SrcVolume)
+	if err != nil {
+		return fmt.Errorf("failed to check source session: %w", err)
+	}
+	if srcMode != "" {
+		return fmt.Errorf("source volume %s/%s has an active session, please delete it first", opts.SrcNode, opts.SrcVolume)
+	}
+
+	// Validate destination volume does not exist
+	_, err = Get(ctx, c, opts.DstNode, opts.DstVolume)
+	if err == nil {
+		return fmt.Errorf("destination volume %s/%s already exists", opts.DstNode, opts.DstVolume)
+	}
+
+	// Create destination volume with same size and type
+	createOpts := CreateOptions{
+		NodeName:   opts.DstNode,
+		VolumeName: opts.DstVolume,
+		Size:       srcInfo.Size,
+	}
+	if srcInfo.IsOSVolume {
+		// For OS volumes, we'll copy files directly instead of using image init
+		// Just create a regular PVC
+		createOpts.Image = "" // Don't init with image, we'll copy files
+	}
+
+	fmt.Printf("Creating destination volume %s/%s (%s)...\n", opts.DstNode, opts.DstVolume, srcInfo.Size)
+
+	// Create destination PVC (without init)
+	dstPVCName := pvcName(opts.DstNode, opts.DstVolume)
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dstPVCName,
+			Namespace: c.Namespace,
+			Labels: map[string]string{
+				sgs.LabelManagedBy:  "sgs",
+				sgs.LabelNodeName:   opts.DstNode,
+				sgs.LabelVolumeName: opts.DstVolume,
+			},
+			Annotations: map[string]string{},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse(srcInfo.Size),
+				},
+			},
+		},
+	}
+
+	// Copy OS image annotation if source is OS volume
+	if srcInfo.IsOSVolume && srcInfo.Image != "" {
+		pvc.Annotations[sgs.AnnotationOSImage] = srcInfo.Image
+	}
+
+	_, err = c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+	if err != nil {
+		return client.FormatK8sError(err, "create", "destination volume", c.Namespace)
+	}
+
+	// Register cleanup for the destination PVC in case of interrupt
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "Cleaning up destination volume...")
+		if err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(cleanupCtx, dstPVCName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+
+	// Perform copy based on whether source and destination are on the same node
+	srcPVCName := pvcName(opts.SrcNode, opts.SrcVolume)
+
+	if opts.SrcNode == opts.DstNode {
+		// Same node: create single pod with both volumes
+		err = copySameNode(ctx, c, opts.SrcNode, srcPVCName, dstPVCName)
+	} else {
+		// Different nodes: stream via tar between two pods
+		err = copyCrossNode(ctx, c, opts.SrcNode, opts.DstNode, srcPVCName, dstPVCName)
+	}
+
+	if err != nil {
+		// If interrupted, signal handler does cleanup - just wait and return
+		if cleanup.WasInterrupted() {
+			cleanup.WaitForCleanup()
+			return nil
+		}
+		// Cleanup destination volume on failure
+		cleanup.Unregister()
+		fmt.Print("Copy failed, cleaning up destination volume...")
+		_ = c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(context.Background(), dstPVCName, metav1.DeleteOptions{})
+		fmt.Println(" done")
+		return err
+	}
+
+	// Success - unregister the PVC cleanup since we want to keep it
+	cleanup.Unregister()
+
+	fmt.Printf("Successfully copied %s/%s to %s/%s\n", opts.SrcNode, opts.SrcVolume, opts.DstNode, opts.DstVolume)
+	return nil
+}
+
+// copySameNode copies volume contents on the same node using a single pod
+func copySameNode(ctx context.Context, c *client.Client, nodeName, srcPVC, dstPVC string) error {
+	podName := "copy-" + dstPVC
+	fmt.Println("Copying volume contents (same node)...")
+
+	// Create copy pod with both volumes mounted
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: c.Namespace,
+			Labels: map[string]string{
+				sgs.LabelManagedBy:    "sgs",
+				"sgs.bacchus.io/mode": "copy",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeSelector: map[string]string{
+				"kubernetes.io/hostname": nodeName,
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "copy",
+					Image: "busybox:latest",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0"),
+							corev1.ResourceMemory: resource.MustParse("0"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(sgs.EditCPULimit),
+							corev1.ResourceMemory: resource.MustParse(sgs.EditMemoryLimit),
+						},
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "src", MountPath: "/src", ReadOnly: true},
+						{Name: "dst", MountPath: "/dst"},
+					},
+					Command: []string{"/bin/sh", "-c"},
+					Args:    []string{"cp -a /src/. /dst/ && echo 'Copy complete'"},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "src",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: srcPVC,
+							ReadOnly:  true,
+						},
+					},
+				},
+				{
+					Name: "dst",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: dstPVC,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
+
+	_, err := c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create copy pod: %w", err)
+	}
+	// Register cleanup for interrupt handling
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "  Cleaning up copy pod...")
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+	defer func() {
+		cleanup.Unregister()
+		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), podName, metav1.DeleteOptions{})
+	}()
+
+	// Wait for pod to complete
+	return waitForCopyPod(ctx, c, podName, 30*time.Minute)
+}
+
+// progressWriter wraps an io.Writer and tracks bytes written
+type progressWriter struct {
+	writer  io.Writer
+	written int64
+	onWrite func(int64)
+}
+
+func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	n, err = pw.writer.Write(p)
+	pw.written += int64(n)
+	if pw.onWrite != nil {
+		pw.onWrite(pw.written)
+	}
+	return
+}
+
+// formatBytes formats bytes into human-readable format
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// copyCrossNode copies volume contents between different nodes using tar stream
+func copyCrossNode(ctx context.Context, c *client.Client, srcNode, dstNode, srcPVC, dstPVC string) error {
+	srcPodName := "copy-src-" + srcPVC
+	dstPodName := "copy-dst-" + dstPVC
+
+	fmt.Println("Copying volume contents (cross-node via tar stream)...")
+
+	// Create source reader pod
+	srcPod := createCopyPod(srcPodName, srcNode, srcPVC, c.Namespace, true)
+	_, err := c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, srcPod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create source pod: %w", err)
+	}
+	// Register cleanup for interrupt handling
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "  Cleaning up source pod...")
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, srcPodName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+	defer func() {
+		cleanup.Unregister()
+		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), srcPodName, metav1.DeleteOptions{})
+	}()
+
+	// Create destination writer pod
+	dstPod := createCopyPod(dstPodName, dstNode, dstPVC, c.Namespace, false)
+	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, dstPod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create destination pod: %w", err)
+	}
+	// Register cleanup for interrupt handling
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "  Cleaning up destination pod...")
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, dstPodName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+	defer func() {
+		cleanup.Unregister()
+		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), dstPodName, metav1.DeleteOptions{})
+	}()
+
+	// Wait for both pods to be running with spinner
+	fmt.Print("  Waiting for copy pods to start...")
+	if err := waitForPodRunning(ctx, c, srcPodName, 5*time.Minute); err != nil {
+		fmt.Println(" failed")
+		return fmt.Errorf("source pod failed to start: %w", err)
+	}
+	if err := waitForPodRunning(ctx, c, dstPodName, 5*time.Minute); err != nil {
+		fmt.Println(" failed")
+		return fmt.Errorf("destination pod failed to start: %w", err)
+	}
+	fmt.Println(" done")
+
+	// Stream data: tar from source | tar to destination
+	fmt.Println("  Streaming data between nodes...")
+
+	// Use a pipe to connect tar output to tar input with progress tracking
+	pr, pw := io.Pipe()
+
+	// Progress tracking
+	var progressMu sync.Mutex
+	var lastPrinted int64
+	progress := &progressWriter{
+		writer: pw,
+		onWrite: func(total int64) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			// Update every 1MB to avoid too frequent updates
+			if total-lastPrinted >= 1024*1024 {
+				fmt.Printf("\r  Transferred: %s", formatBytes(total))
+				lastPrinted = total
+			}
+		},
+	}
+
+	// Capture stderr for error messages
+	var srcStderr, dstStderr bytes.Buffer
+
+	errChan := make(chan error, 2)
+
+	// Source: tar cf - /data
+	go func() {
+		defer pw.Close()
+		err := execInPod(ctx, c, srcPodName, []string{"tar", "cf", "-", "-C", "/data", "."}, nil, progress, &srcStderr)
+		if err != nil && srcStderr.Len() > 0 {
+			err = fmt.Errorf("%w: %s", err, srcStderr.String())
+		}
+		errChan <- err
+	}()
+
+	// Destination: tar xf - -C /data
+	go func() {
+		err := execInPod(ctx, c, dstPodName, []string{"tar", "xf", "-", "-C", "/data"}, pr, nil, &dstStderr)
+		if err != nil && dstStderr.Len() > 0 {
+			err = fmt.Errorf("%w: %s", err, dstStderr.String())
+		}
+		errChan <- err
+	}()
+
+	// Wait for both to complete
+	for i := 0; i < 2; i++ {
+		if err := <-errChan; err != nil {
+			return fmt.Errorf("copy stream failed: %w", err)
+		}
+	}
+
+	// Print final progress
+	fmt.Printf("\r  Transferred: %s\n", formatBytes(progress.written))
+
+	return nil
+}
+
+// createCopyPod creates a pod for cross-node copy (long-running sleep)
+func createCopyPod(name, nodeName, pvcName, namespace string, readOnly bool) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				sgs.LabelManagedBy:    "sgs",
+				"sgs.bacchus.io/mode": "copy",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeSelector: map[string]string{
+				"kubernetes.io/hostname": nodeName,
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "copy",
+					Image: "busybox:latest",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0"),
+							corev1.ResourceMemory: resource.MustParse("0"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(sgs.EditCPULimit),
+							corev1.ResourceMemory: resource.MustParse(sgs.EditMemoryLimit),
+						},
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "data", MountPath: "/data", ReadOnly: readOnly},
+					},
+					Command: []string{"/bin/sh", "-c"},
+					Args:    []string{"sleep 3600"}, // Stay alive for exec
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "data",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+							ReadOnly:  readOnly,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
+}
+
+// waitForCopyPod waits for the copy pod to complete
+func waitForCopyPod(ctx context.Context, c *client.Client, podName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	// Spinner characters for progress indication
+	spinChars := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	spinIdx := 0
+	startTime := time.Now()
+
+	for time.Now().Before(deadline) {
+		pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			fmt.Print("\r                              \r") // Clear spinner line
+			return fmt.Errorf("failed to get copy pod: %w", err)
+		}
+
+		elapsed := time.Since(startTime).Round(time.Second)
+		switch pod.Status.Phase {
+		case corev1.PodSucceeded:
+			fmt.Printf("\r  Copying... done (%s)       \n", elapsed)
+			return nil
+		case corev1.PodFailed:
+			fmt.Print("\r                              \r") // Clear spinner line
+			return fmt.Errorf("copy pod failed")
+		case corev1.PodPending:
+			// Check for errors
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.State.Waiting != nil {
+					if cs.State.Waiting.Reason == "ImagePullBackOff" || cs.State.Waiting.Reason == "ErrImagePull" {
+						fmt.Print("\r                              \r") // Clear spinner line
+						return fmt.Errorf("failed to pull image: %s", cs.State.Waiting.Message)
+					}
+				}
+			}
+			fmt.Printf("\r  %s Waiting for copy pod to start... (%s)", spinChars[spinIdx], elapsed)
+		case corev1.PodRunning:
+			fmt.Printf("\r  %s Copying... (%s)", spinChars[spinIdx], elapsed)
+		}
+		spinIdx = (spinIdx + 1) % len(spinChars)
+
+		select {
+		case <-ctx.Done():
+			fmt.Print("\r                              \r") // Clear spinner line
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	fmt.Print("\r                              \r") // Clear spinner line
+	return fmt.Errorf("timeout waiting for copy to complete")
+}
+
+// waitForPodRunning waits for a pod to be running
+func waitForPodRunning(ctx context.Context, c *client.Client, podName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		// Check context first
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("failed to get pod: %w", err)
+		}
+
+		if pod.Status.Phase == corev1.PodRunning {
+			return nil
+		}
+		if pod.Status.Phase == corev1.PodFailed {
+			return fmt.Errorf("pod failed")
+		}
+
+		// Check for pending errors
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.State.Waiting != nil {
+				if cs.State.Waiting.Reason == "ImagePullBackOff" || cs.State.Waiting.Reason == "ErrImagePull" {
+					return fmt.Errorf("failed to pull image: %s", cs.State.Waiting.Message)
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for pod to start")
+}
+
+// execInPod executes a command in a pod with stdin/stdout/stderr
+func execInPod(ctx context.Context, c *client.Client, podName string, command []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	req := c.Clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(c.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: command,
+			Stdin:   stdin != nil,
+			Stdout:  stdout != nil,
+			Stderr:  stderr != nil,
+			TTY:     false,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(c.Config, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+		Tty:    false,
 	})
 }

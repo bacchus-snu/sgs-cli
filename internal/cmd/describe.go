@@ -14,6 +14,7 @@ var describeCmd = &cobra.Command{
 	Long: `Show detailed information about a resource.
 
 Resource types:
+  all                - Describe all resources (nodes, volumes, sessions, workspaces)
   nodes              - Describe all worker nodes with detailed info
   node <name>        - Describe a specific node
   volumes            - Describe all volumes with detailed info
@@ -25,6 +26,9 @@ Resource types:
   me                 - Show your user information
 
 Examples:
+  # Describe all resources
+  sgs describe all
+
   # Describe all worker nodes
   sgs describe nodes
 
@@ -70,31 +74,32 @@ func runDescribe(cmd *cobra.Command, args []string) {
 	}
 
 	switch resource {
-	case "nodes":
-		getNodes(ctx, k8sClient, true)
-	case "node":
+	case "all":
+		getAll(ctx, k8sClient, true)
+	case "nodes", "node":
 		if name == "" {
-			exitWithError("node name required", nil)
+			getNodes(ctx, k8sClient, true)
+		} else {
+			getNode(ctx, k8sClient, name, true)
 		}
-		getNode(ctx, k8sClient, name, true)
-	case "volumes":
-		getVolumes(ctx, k8sClient, true)
-	case "volume":
+	case "volumes", "volume":
 		if name == "" {
-			exitWithError("volume name required", nil)
+			getVolumes(ctx, k8sClient, true)
+		} else {
+			getVolume(ctx, k8sClient, name, true)
 		}
-		getVolume(ctx, k8sClient, name, true)
-	case "sessions":
-		getSessions(ctx, k8sClient, true)
-	case "session":
+	case "sessions", "session":
 		if name == "" {
-			exitWithError("session name required", nil)
+			getSessions(ctx, k8sClient, true)
+		} else {
+			getSession(ctx, k8sClient, name, true)
 		}
-		getSession(ctx, k8sClient, name, true)
-	case "workspaces":
-		getWorkspaces(ctx, k8sClient, true)
-	case "workspace":
-		getWorkspace(ctx, k8sClient, name, true)
+	case "workspaces", "workspace":
+		if name == "" {
+			getWorkspaces(ctx, k8sClient, true)
+		} else {
+			getWorkspace(ctx, k8sClient, name, true)
+		}
 	case "me":
 		getMe(true)
 	default:

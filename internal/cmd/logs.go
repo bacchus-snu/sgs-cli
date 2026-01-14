@@ -3,11 +3,10 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"github.com/bacchus-snu/sgs-cli/internal/client"
 	"github.com/bacchus-snu/sgs-cli/internal/session"
+	"github.com/bacchus-snu/sgs-cli/internal/volume"
 	"github.com/spf13/cobra"
 )
 
@@ -17,27 +16,21 @@ var (
 )
 
 var logsCmd = &cobra.Command{
-	Use:   "logs <node>/<volume>[/<number>]",
+	Use:   "logs <node>/<volume>",
 	Short: "Print logs from a session",
 	Long: `Print logs from a session (edit or run pod).
 
-Session path format: <node>/<volume>[/<number>]
-  - Session number is optional, defaults to 0 (edit session)
-  - Session 0 is the edit session
-  - Sessions 1+ are run sessions
+Session path format: <node>/<volume>
 
 Examples:
-  # Print logs from an edit session (session 0)
+  # Print logs from a session
   sgs logs ferrari/os-volume
 
-  # Print logs from a run session
-  sgs logs ferrari/os-volume/1
-
   # Follow logs
-  sgs logs ferrari/os-volume/1 -f
+  sgs logs ferrari/os-volume -f
 
   # Print last 100 lines
-  sgs logs ferrari/os-volume/1 --tail 100`,
+  sgs logs ferrari/os-volume --tail 100`,
 	Args: cobra.ExactArgs(1),
 	Run:  runLogs,
 }
@@ -50,30 +43,14 @@ func init() {
 func runLogs(cmd *cobra.Command, args []string) {
 	sessionPath := args[0]
 
-	// Parse path: <node>/<volume>[/<number>]
-	parts := strings.Split(sessionPath, "/")
-	if len(parts) < 2 || len(parts) > 3 {
-		exitWithError("invalid session path format, expected: <node>/<volume>[/<number>]", nil)
+	// Parse path: <node>/<volume>
+	nodeName, volumeName, err := volume.ParseVolumePath(sessionPath)
+	if err != nil {
+		exitWithError("invalid session path format, expected: <node>/<volume>", nil)
 	}
 
-	nodeName := parts[0]
-	volumeName := parts[1]
-	sessionNumber := 0 // Default to edit session
-
-	if len(parts) == 3 {
-		var err error
-		sessionNumber, err = strconv.Atoi(parts[2])
-		if err != nil {
-			exitWithError("invalid session number", err)
-		}
-	}
-
-	if nodeName == "" || volumeName == "" {
-		exitWithError("invalid session path format, expected: <node>/<volume>[/<number>]", nil)
-	}
-
-	// Convert to pod name: <node>-<volume>-<number>
-	podName := fmt.Sprintf("%s-%s-%d", nodeName, volumeName, sessionNumber)
+	// Convert to pod name: <node>-<volume>
+	podName := fmt.Sprintf("%s-%s", nodeName, volumeName)
 
 	ctx := context.Background()
 
@@ -89,7 +66,7 @@ func runLogs(cmd *cobra.Command, args []string) {
 
 	logs, err := session.Logs(ctx, k8sClient, podName, opts)
 	if err != nil {
-		exitWithError("failed to get logs", err)
+		exitWithError("", err)
 	}
 
 	fmt.Print(logs)

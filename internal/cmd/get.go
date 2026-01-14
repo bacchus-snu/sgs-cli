@@ -22,6 +22,7 @@ var getCmd = &cobra.Command{
 	Long: `Display one or more resources.
 
 Resource types:
+  all                - List all resources (nodes, volumes, sessions, workspaces)
   nodes              - List all worker nodes in the cluster
   node <name>        - Get details for a specific node
   volumes            - List all volumes in current workspace
@@ -33,6 +34,9 @@ Resource types:
   me                 - Show your user information
 
 Examples:
+  # List all resources
+  sgs get all
+
   # List all worker nodes
   sgs get nodes
 
@@ -78,29 +82,32 @@ func runGet(cmd *cobra.Command, args []string) {
 	}
 
 	switch resource {
-	case "nodes":
-		getNodes(ctx, k8sClient, false)
-	case "node":
+	case "all":
+		getAll(ctx, k8sClient, false)
+	case "nodes", "node":
 		if name == "" {
-			exitWithError("node name required", nil)
+			getNodes(ctx, k8sClient, false)
+		} else {
+			getNode(ctx, k8sClient, name, false)
 		}
-		getNode(ctx, k8sClient, name, false)
-	case "volumes":
-		getVolumes(ctx, k8sClient, false)
-	case "volume":
+	case "volumes", "volume":
 		if name == "" {
-			exitWithError("volume name required", nil)
+			getVolumes(ctx, k8sClient, false)
+		} else {
+			getVolume(ctx, k8sClient, name, false)
 		}
-		getVolume(ctx, k8sClient, name, false)
-	case "sessions":
-		getSessions(ctx, k8sClient, false)
-	case "session":
+	case "sessions", "session":
 		if name == "" {
-			exitWithError("session name required", nil)
+			getSessions(ctx, k8sClient, false)
+		} else {
+			getSession(ctx, k8sClient, name, false)
 		}
-		getSession(ctx, k8sClient, name, false)
-	case "workspaces":
-		getWorkspaces(ctx, k8sClient, false)
+	case "workspaces", "workspace":
+		if name == "" {
+			getWorkspaces(ctx, k8sClient, false)
+		} else {
+			getWorkspace(ctx, k8sClient, name, false)
+		}
 	case "current-workspace":
 		getWorkspace(ctx, k8sClient, "", false)
 	case "me":
@@ -113,7 +120,7 @@ func runGet(cmd *cobra.Command, args []string) {
 func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	nodes, err := node.ListWorkerNodes(ctx, k8sClient)
 	if err != nil {
-		exitWithError("failed to list nodes", err)
+		exitWithError("", err)
 	}
 
 	if len(nodes) == 0 {
@@ -160,29 +167,24 @@ func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 		}
 	}
 	w.Flush()
+
+	if verbose {
+		fmt.Println("\nNote: CPU/memory usage shows total limits. Due to oversubscription, usage may exceed physical capacity.")
+	}
 }
 
 // formatNodeAccess formats the node group for display
-// graduate nodegroup → "graduate-only"
-// undergraduate nodegroup → "graduate/undergraduate"
 func formatNodeAccess(group string) string {
-	switch group {
-	case "graduate":
-		return "graduate-only"
-	case "undergraduate":
-		return "graduate/undergraduate"
-	default:
-		if group == "" {
-			return "-"
-		}
-		return group
+	if group == "" {
+		return "-"
 	}
+	return group
 }
 
 func getVolumes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	volumes, err := volume.List(ctx, k8sClient)
 	if err != nil {
-		exitWithError("failed to list volumes", err)
+		exitWithError("", err)
 	}
 
 	if len(volumes) == 0 {
@@ -224,7 +226,7 @@ func getNodeInfo(ctx context.Context, k8sClient *client.Client, nodeName string,
 func getNode(ctx context.Context, k8sClient *client.Client, nodeName string, verbose bool) {
 	info, err := node.GetResourceInfo(ctx, k8sClient, nodeName)
 	if err != nil {
-		exitWithError("node not found", err)
+		exitWithError("", err)
 	}
 
 	fmt.Printf("Node: %s\n", nodeName)
@@ -263,7 +265,7 @@ func getNode(ctx context.Context, k8sClient *client.Client, nodeName string, ver
 			fmt.Println("  (none)")
 		} else {
 			for _, s := range sessions {
-				fmt.Printf("  - %s-%d [%s] (%s)\n", s.VolumeName, s.Number, s.Type, s.Status)
+				fmt.Printf("  - %s [%s] (%s)\n", s.VolumeName, s.Type, s.Status)
 			}
 		}
 	}
@@ -289,7 +291,7 @@ func getVolume(ctx context.Context, k8sClient *client.Client, volumePath string,
 
 	v, err := volume.Get(ctx, k8sClient, nodeName, volumeName)
 	if err != nil {
-		exitWithError("volume not found", err)
+		exitWithError("", err)
 	}
 
 	fmt.Printf("Volume: %s/%s\n", nodeName, volumeName)
@@ -313,7 +315,7 @@ func getVolume(ctx context.Context, k8sClient *client.Client, volumePath string,
 			fmt.Println("  (none)")
 		} else {
 			for _, s := range sessions {
-				fmt.Printf("  - %s-%d [%s] (%s)\n", s.VolumeName, s.Number, s.Type, s.Status)
+				fmt.Printf("  - %s [%s] (%s)\n", s.VolumeName, s.Type, s.Status)
 			}
 		}
 	}
@@ -322,7 +324,7 @@ func getVolume(ctx context.Context, k8sClient *client.Client, volumePath string,
 func getSession(ctx context.Context, k8sClient *client.Client, sessionName string, verbose bool) {
 	s, err := session.Get(ctx, k8sClient, sessionName)
 	if err != nil {
-		exitWithError("session not found", err)
+		exitWithError("", err)
 	}
 
 	fmt.Printf("Session: %s\n", sessionName)
@@ -337,7 +339,7 @@ func getSession(ctx context.Context, k8sClient *client.Client, sessionName strin
 func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	workspaces, err := workspace.List(ctx, k8sClient)
 	if err != nil {
-		exitWithError("failed to list workspaces", err)
+		exitWithError("", err)
 	}
 
 	if len(workspaces) == 0 {
@@ -402,7 +404,7 @@ func getWorkspace(ctx context.Context, k8sClient *client.Client, name string, ve
 func getSessions(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	sessions, err := session.List(ctx, k8sClient)
 	if err != nil {
-		exitWithError("failed to list sessions", err)
+		exitWithError("", err)
 	}
 
 	if len(sessions) == 0 {
@@ -412,19 +414,23 @@ func getSessions(ctx context.Context, k8sClient *client.Client, verbose bool) {
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if verbose {
-		fmt.Fprintln(w, "NODE\tVOLUME\tTYPE\tNUMBER\tSTATUS\tGPU\tCOMMAND\tAGE")
+		fmt.Fprintln(w, "NODE\tVOLUME\tMODE\tSTATUS\tGPU\tGPUMEM\tCOMMAND\tAGE")
 	} else {
-		fmt.Fprintln(w, "NODE\tVOLUME\tTYPE\tNUMBER\tSTATUS\tCOMMAND")
+		fmt.Fprintln(w, "NODE\tVOLUME\tMODE\tSTATUS\tCOMMAND")
 	}
 
 	for _, s := range sessions {
 		cmd := truncateCommand(s.Command, 40)
 		if verbose {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\n",
-				s.Node, s.VolumeName, s.Type, s.Number, s.Status, s.GPUs, cmd, s.Age)
+			gpuMem := "-"
+			if s.GPUMem > 0 {
+				gpuMem = fmt.Sprintf("%dMi", s.GPUMem)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
+				s.Node, s.VolumeName, s.Type, s.Status, s.GPUs, gpuMem, cmd, s.Age)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
-				s.Node, s.VolumeName, s.Type, s.Number, s.Status, cmd)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+				s.Node, s.VolumeName, s.Type, s.Status, cmd)
 		}
 	}
 	w.Flush()
@@ -436,4 +442,29 @@ func truncateCommand(cmd string, maxLen int) string {
 		return cmd
 	}
 	return cmd[:maxLen-3] + "..."
+}
+
+// getAll displays all resources (nodes, volumes, sessions, workspaces)
+func getAll(ctx context.Context, k8sClient *client.Client, verbose bool) {
+	// Get current workspace for header
+	currentWS := k8sClient.Namespace
+
+	// Workspaces
+	fmt.Println("--- Workspaces ---")
+	getWorkspaces(ctx, k8sClient, verbose)
+	fmt.Println()
+
+	// Nodes
+	fmt.Println("--- Nodes ---")
+	getNodes(ctx, k8sClient, verbose)
+	fmt.Println()
+
+	// Volumes
+	fmt.Printf("--- Volumes (workspace: %s) ---\n", currentWS)
+	getVolumes(ctx, k8sClient, verbose)
+	fmt.Println()
+
+	// Sessions
+	fmt.Printf("--- Sessions (workspace: %s) ---\n", currentWS)
+	getSessions(ctx, k8sClient, verbose)
 }

@@ -1,3 +1,6 @@
+// Package user provides functionality for extracting user identity
+// from OIDC tokens in kubeconfig. It parses JWT tokens to retrieve
+// user information such as username and group memberships.
 package user
 
 import (
@@ -97,14 +100,4 @@ func (u *UserInfo) HasGroup(group string) bool {
 		}
 	}
 	return false
-}
-
-// IsGraduate returns true if the user is in the graduate group
-func (u *UserInfo) IsGraduate() bool {
-	return u.HasGroup("graduate")
-}
-
-// IsUndergraduate returns true if the user is in the undergraduate group
-func (u *UserInfo) IsUndergraduate() bool {
-	return u.HasGroup("undergraduate")
 }

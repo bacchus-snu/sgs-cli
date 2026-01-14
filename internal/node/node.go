@@ -1,3 +1,6 @@
+// Package node provides functionality for managing Kubernetes nodes
+// within the SGS (Sommelier GPU System) environment. It handles node
+// listing, resource queries, and GPU availability checks.
 package node
 
 import (
@@ -25,9 +28,11 @@ type ResourceInfo struct {
 
 // ListWorkerNodes returns all worker nodes (excludes control plane nodes)
 func ListWorkerNodes(ctx context.Context, c *client.Client) ([]corev1.Node, error) {
-	nodeList, err := c.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	nodeList, err := client.RetryWithContext(ctx, func() (*corev1.NodeList, error) {
+		return c.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list nodes: %w", err)
+		return nil, client.FormatK8sError(err, "list", "nodes", "cluster")
 	}
 
 	var workerNodes []corev1.Node
@@ -49,9 +54,11 @@ func ListWorkerNodes(ctx context.Context, c *client.Client) ([]corev1.Node, erro
 // GetResourceInfo returns resource usage information for a specific node
 func GetResourceInfo(ctx context.Context, c *client.Client, nodeName string) (*ResourceInfo, error) {
 	// Get node
-	node, err := c.Clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	node, err := client.RetryWithContext(ctx, func() (*corev1.Node, error) {
+		return c.Clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get node: %w", err)
+		return nil, client.FormatK8sError(err, "get", "node", "cluster")
 	}
 
 	// Get allocatable resources
@@ -67,27 +74,35 @@ func GetResourceInfo(ctx context.Context, c *client.Client, nodeName string) (*R
 	}
 
 	// Get pods on this node to calculate usage
-	pods, err := c.Clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("spec.nodeName=%s,status.phase!=Failed,status.phase!=Succeeded", nodeName),
+	pods, err := client.RetryWithContext(ctx, func() (*corev1.PodList, error) {
+		return c.Clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("spec.nodeName=%s,status.phase!=Failed,status.phase!=Succeeded", nodeName),
+		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
+		return nil, client.FormatK8sError(err, "list", "pods", "cluster")
 	}
 
-	// Sum up requested resources from all pods
+	// Sum up resource limits from all pods
+	// Note: We use limits (not requests) because SGS supports CPU/memory oversubscription.
+	// This means the sum of limits may exceed the node's physical capacity.
 	cpuUsed := resource.NewQuantity(0, resource.DecimalSI)
 	memUsed := resource.NewQuantity(0, resource.BinarySI)
 	var gpuUsed int64
 
 	for _, pod := range pods.Items {
 		for _, container := range pod.Spec.Containers {
-			if container.Resources.Requests != nil {
-				if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
+			// Use Limits for CPU and memory (oversubscription supported)
+			if container.Resources.Limits != nil {
+				if cpu, ok := container.Resources.Limits[corev1.ResourceCPU]; ok {
 					cpuUsed.Add(cpu)
 				}
-				if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
+				if mem, ok := container.Resources.Limits[corev1.ResourceMemory]; ok {
 					memUsed.Add(mem)
 				}
+			}
+			// Use Requests for GPU (no oversubscription for GPUs)
+			if container.Resources.Requests != nil {
 				if gpu, ok := container.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")]; ok {
 					gpuUsed += gpu.Value()
 				}
