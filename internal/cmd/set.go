@@ -26,8 +26,23 @@ Examples:
 	Run:  runSetWorkspace,
 }
 
+var setModeCmd = &cobra.Command{
+	Use:    "mode <prod|dev>",
+	Short:  "Switch between production and development clusters",
+	Long: `Switch between production and development clusters.
+
+- prod: Use the production cluster (default)
+- dev: Use the development cluster
+
+This command is hidden and intended for internal use only.`,
+	Args:   cobra.ExactArgs(1),
+	Hidden: true,
+	Run:    runSetMode,
+}
+
 func init() {
 	setCmd.AddCommand(setWorkspaceCmd)
+	setCmd.AddCommand(setModeCmd)
 }
 
 func runSetWorkspace(cmd *cobra.Command, args []string) {
@@ -38,4 +53,19 @@ func runSetWorkspace(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Printf("Workspace set to: %s\n", workspace)
+}
+
+func runSetMode(cmd *cobra.Command, args []string) {
+	mode := args[0]
+
+	// Validate mode
+	if mode != "prod" && mode != "dev" {
+		exitWithError("mode must be either 'prod' or 'dev'", nil)
+	}
+
+	if err := client.SetMode(mode); err != nil {
+		exitWithError("failed to set mode", err)
+	}
+
+	fmt.Printf("Mode set to %s\n", mode)
 }

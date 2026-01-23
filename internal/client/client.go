@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/bacchus-snu/sgs-cli/internal/sgs"
@@ -83,8 +82,8 @@ func constantsPath() string {
 	return filepath.Join(os.Getenv("HOME"), ".sgs", "constants.yaml")
 }
 
-// configURL is the URL to download the kubeconfig template from
-const configURL = "https://raw.githubusercontent.com/bacchus-snu/sgs/refs/heads/master/controller/kubeconfig.template"
+// configURL is the URL to download the kubeconfig from
+const configURL = "https://raw.githubusercontent.com/bacchus-snu/sgs/refs/heads/master/controller/config.yaml"
 
 // constantsURL is the URL to download the constants configuration from
 const constantsURL = "https://raw.githubusercontent.com/bacchus-snu/sgs-cli/refs/heads/main/constants.yaml"
@@ -148,21 +147,8 @@ func FetchConfig() error {
 		return fmt.Errorf("failed to read kubeconfig response: %w", err)
 	}
 
-	// Apply modifications to the template
-	content := string(data)
-
-	// Remove -{{ . }} postfix from contexts.name and current-context
-	content = strings.ReplaceAll(content, "snucse-sommelier-{{ . }}", "snucse-sommelier")
-
-	// Remove the namespace line
-	content = strings.ReplaceAll(content, "      namespace: ws-{{ . }}\n", "")
-
-	// Add token-cache-dir after oidc-extra-scope=groups
-	content = strings.ReplaceAll(content,
-		"          - --oidc-extra-scope=groups",
-		"          - --oidc-extra-scope=groups\n          - --token-cache-dir=~/.sgs/cache")
-
-	if err := os.WriteFile(configFile, []byte(content), 0600); err != nil {
+	// Write the config directly (no modifications needed)
+	if err := os.WriteFile(configFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write kubeconfig: %w", err)
 	}
 
@@ -351,6 +337,44 @@ func SetWorkspace(workspace string) error {
 			context["namespace"] = workspace
 			break
 		}
+	}
+
+	// Write back the config
+	newData, err := yaml.Marshal(kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(kubeconfigPath, newData, 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	return nil
+}
+
+// SetMode switches between production and development clusters
+func SetMode(mode string) error {
+	kubeconfigPath := configPath()
+
+	data, err := os.ReadFile(kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+
+	// Parse the kubeconfig
+	var kubeconfig map[string]interface{}
+	if err := yaml.Unmarshal(data, &kubeconfig); err != nil {
+		return fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Set the current-context based on mode
+	switch mode {
+	case "prod":
+		kubeconfig["current-context"] = "sgs"
+	case "dev":
+		kubeconfig["current-context"] = "sgs-dev"
+	default:
+		return fmt.Errorf("invalid mode: %s (must be 'prod' or 'dev')", mode)
 	}
 
 	// Write back the config
