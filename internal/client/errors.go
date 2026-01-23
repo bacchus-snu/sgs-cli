@@ -33,6 +33,11 @@ func FormatK8sError(err error, operation, resource, namespace string) error {
 
 		switch status.Reason {
 		case "Forbidden":
+			// Special case: if namespace is "default" and wasn't explicitly set,
+			// it's likely the user hasn't configured their workspace yet
+			if namespace == "default" && !IsNamespaceExplicitlySet() {
+				return fmt.Errorf("no workspace set. Use 'sgs set workspace <workspace-name>' to set your workspace")
+			}
 			username := extractUsername(status.Message)
 			if username != "" {
 				return fmt.Errorf("user %q does not have permission to %s %s in workspace %q", username, operation, resource, namespace)
@@ -57,6 +62,11 @@ func FormatK8sError(err error, operation, resource, namespace string) error {
 	errStr := err.Error()
 
 	if strings.Contains(errStr, "forbidden") || strings.Contains(errStr, "Forbidden") {
+		// Special case: if namespace is "default" and wasn't explicitly set,
+		// it's likely the user hasn't configured their workspace yet
+		if namespace == "default" && !IsNamespaceExplicitlySet() {
+			return fmt.Errorf("no workspace set. Use 'sgs set workspace <workspace-name>' to set your workspace")
+		}
 		username := extractUsername(errStr)
 		if username != "" {
 			return fmt.Errorf("user %q does not have permission to %s %s in workspace %q", username, operation, resource, namespace)

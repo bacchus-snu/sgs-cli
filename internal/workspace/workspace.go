@@ -158,6 +158,17 @@ func GetCurrent(ctx context.Context, c *client.Client) (*WorkspaceInfo, error) {
 	return Get(ctx, c, c.Namespace)
 }
 
+// Exists checks if a workspace exists (but doesn't check permission)
+func Exists(ctx context.Context, c *client.Client, name string) bool {
+	ns, err := c.Clientset.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false
+	}
+	// Check if it's an SGS workspace
+	_, ok := ns.Labels[sgs.LabelWorkspaceID]
+	return ok
+}
+
 // CanAccessNode checks if the current workspace can access a node based on node group.
 // Returns true if access is allowed, false otherwise.
 // The nodeGroupLabel parameter is the value of "node-restriction.kubernetes.io/nodegroup" on the node.

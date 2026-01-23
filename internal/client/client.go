@@ -296,6 +296,38 @@ func getCurrentNamespace(kubeconfigPath string) (string, error) {
 	return "default", nil
 }
 
+// IsNamespaceExplicitlySet checks if the namespace was explicitly set in kubeconfig
+func IsNamespaceExplicitlySet() bool {
+	kubeconfigPath := configPath()
+
+	data, err := os.ReadFile(kubeconfigPath)
+	if err != nil {
+		return false
+	}
+
+	var kubeconfig struct {
+		CurrentContext string `yaml:"current-context"`
+		Contexts       []struct {
+			Name    string `yaml:"name"`
+			Context struct {
+				Namespace string `yaml:"namespace"`
+			} `yaml:"context"`
+		} `yaml:"contexts"`
+	}
+
+	if err := yaml.Unmarshal(data, &kubeconfig); err != nil {
+		return false
+	}
+
+	for _, ctx := range kubeconfig.Contexts {
+		if ctx.Name == kubeconfig.CurrentContext {
+			return ctx.Context.Namespace != ""
+		}
+	}
+
+	return false
+}
+
 // SetWorkspace updates the namespace in the kubeconfig file
 func SetWorkspace(workspace string) error {
 	kubeconfigPath := configPath()

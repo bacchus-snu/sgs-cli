@@ -31,6 +31,20 @@ var (
 	DefaultImage    = "nvcr.io/nvidia/cuda:12.5.0-base-ubuntu22.04"
 )
 
+// isForbiddenError checks if an error is a Forbidden/permission error
+func isForbiddenError(err error) bool {
+	if statusErr, ok := err.(*errors.StatusError); ok {
+		return statusErr.ErrStatus.Reason == "Forbidden"
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "forbidden") || strings.Contains(errStr, "Forbidden")
+}
+
+// workspaceExists checks if a workspace exists (but doesn't check permission)
+func workspaceExists(ctx context.Context, c *client.Client, name string) bool {
+	return workspace.Exists(ctx, c, name)
+}
+
 // VolumeInfo represents information about an SGS volume
 type VolumeInfo struct {
 	NodeName   string
@@ -108,6 +122,16 @@ func List(ctx context.Context, c *client.Client) ([]VolumeInfo, error) {
 		return c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).List(ctx, metav1.ListOptions{})
 	})
 	if err != nil {
+		// For Forbidden errors, check if the workspace exists to provide better error message
+		if isForbiddenError(err) && !client.IsNamespaceExplicitlySet() && c.Namespace == "default" {
+			return nil, client.FormatK8sError(err, "list", "volumes", c.Namespace)
+		}
+		if isForbiddenError(err) {
+			// Check if workspace exists (don't use workspace.Exists to avoid circular dependency)
+			if exists := workspaceExists(ctx, c, c.Namespace); !exists {
+				return nil, fmt.Errorf("workspace %q does not exist", c.Namespace)
+			}
+		}
 		return nil, client.FormatK8sError(err, "list", "volumes", c.Namespace)
 	}
 
