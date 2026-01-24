@@ -870,13 +870,14 @@ func waitForPodDeleted(ctx context.Context, c *client.Client, podName string, ti
 }
 
 // StopSession stops a session by deleting the pod and waiting for deletion to complete
+// Works for pods in any state (Running, Pending, Failed, Succeeded)
 func StopSession(ctx context.Context, c *client.Client, nodeName, volumeName string) error {
 	podName := sessionPodName(nodeName, volumeName)
 
 	err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return nil // Already deleted
+			return fmt.Errorf("no session found for volume %q", nodeName+"/"+volumeName)
 		}
 		return client.FormatK8sError(err, "stop", "session", c.Namespace)
 	}
@@ -902,14 +903,16 @@ func Stop(ctx context.Context, c *client.Client, podName string) error {
 // Delete deletes a volume (PVC only, session must be deleted first)
 func Delete(ctx context.Context, c *client.Client, nodeName, volumeName string) error {
 	name := pvcName(nodeName, volumeName)
+	podName := sessionPodName(nodeName, volumeName)
 
-	// Check if there's an active session - if so, block deletion
-	mode, err := GetSessionMode(ctx, c, nodeName, volumeName)
-	if err != nil {
-		return client.FormatK8sError(err, "check", "session status", c.Namespace)
+	// Check if there's any session pod (regardless of status) - if so, block deletion
+	_, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err == nil {
+		// Pod exists - block deletion
+		return fmt.Errorf("cannot delete volume: session exists. Delete the session first with: sgs delete session %s/%s", nodeName, volumeName)
 	}
-	if mode != "" {
-		return fmt.Errorf("cannot delete volume: active %s session exists. Delete the session first with: sgs delete session %s/%s", mode, nodeName, volumeName)
+	if !errors.IsNotFound(err) {
+		return client.FormatK8sError(err, "check", "session status", c.Namespace)
 	}
 
 	// Delete PVC

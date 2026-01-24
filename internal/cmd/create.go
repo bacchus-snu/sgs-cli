@@ -35,8 +35,9 @@ var createCmd = &cobra.Command{
 }
 
 var createVolumeCmd = &cobra.Command{
-	Use:   "volume <node-name>/<volume-name>",
-	Short: "Create a new volume",
+	Use:     "volume <node-name>/<volume-name>",
+	Aliases: []string{"volumes"},
+	Short:   "Create a new volume",
 	Long: `Create a new persistent volume on a specific node.
 
 There are two types of volumes:
@@ -66,8 +67,9 @@ Examples:
 }
 
 var createSessionCmd = &cobra.Command{
-	Use:   "session <node>/<volume>",
-	Short: "Create a session on an OS volume",
+	Use:     "session <node>/<volume>",
+	Aliases: []string{"sessions"},
+	Short:   "Create a session on an OS volume",
 	Long: `Create a session on an OS volume.
 
 By default (or with --edit): Creates an edit session for interactive use.

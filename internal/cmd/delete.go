@@ -15,8 +15,9 @@ var deleteCmd = &cobra.Command{
 }
 
 var deleteVolumeCmd = &cobra.Command{
-	Use:   "volume <node>/<volume>",
-	Short: "Delete a volume",
+	Use:     "volume <node>/<volume>",
+	Aliases: []string{"volumes"},
+	Short:   "Delete a volume",
 	Long: `Delete a persistent volume.
 
 This will delete both the Pod and the PersistentVolumeClaim.
@@ -30,8 +31,9 @@ Examples:
 }
 
 var deleteSessionCmd = &cobra.Command{
-	Use:   "session <node>/<volume>",
-	Short: "Delete a session",
+	Use:     "session <node>/<volume>",
+	Aliases: []string{"sessions"},
+	Short:   "Delete a session",
 	Long: `Delete a session.
 
 Examples:
@@ -87,18 +89,10 @@ func runDeleteSession(cmd *cobra.Command, args []string) {
 		exitWithError("failed to create client", err)
 	}
 
-	// Check if session exists
-	mode, err := volume.GetSessionMode(ctx, k8sClient, nodeName, volumeName)
-	if err != nil {
-		exitWithError("", err)
-	}
+	fmt.Printf("Deleting session for %s/%s...\n", nodeName, volumeName)
 
-	if mode == "" {
-		exitWithError(fmt.Sprintf("no session found for %s/%s", nodeName, volumeName), nil)
-	}
-
-	fmt.Printf("Deleting %s session for %s/%s...\n", mode, nodeName, volumeName)
-
+	// StopSession handles pods in any state (Running, Pending, Failed, Succeeded)
+	// and returns an error if the pod doesn't exist
 	if err := volume.StopSession(ctx, k8sClient, nodeName, volumeName); err != nil {
 		exitWithError("", err)
 	}
