@@ -173,12 +173,27 @@ func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	}
 }
 
-// formatNodeAccess formats the node group for display
+// formatNodeAccess formats the node access for display based on the new access rules.
+// - Nodes with "undergraduate" label: accessible by all workspaces (graduate + undergraduate)
+// - Nodes with other/no label: accessible only by graduate workspaces
 func formatNodeAccess(group string) string {
-	if group == "" {
-		return "-"
+	if group == "undergraduate" {
+		return "graduate/undergraduate"
 	}
-	return group
+	return "graduate"
+}
+
+// formatWorkspaceAccess formats the workspace access for display.
+// - Graduate workspaces (or no annotation) can access all nodes
+// - Undergraduate workspaces can only access undergraduate nodes
+func formatWorkspaceAccess(nodeGroup string) string {
+	if nodeGroup == "graduate" || nodeGroup == "" {
+		return "graduate/undergraduate"
+	}
+	if nodeGroup == "undergraduate" {
+		return "undergraduate"
+	}
+	return nodeGroup
 }
 
 func getVolumes(ctx context.Context, k8sClient *client.Client, verbose bool) {
@@ -349,23 +364,23 @@ func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool) 
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if verbose {
-		fmt.Fprintln(w, "NAME\tNODE GROUP\tGPU QUOTA\tCPU QUOTA\tMEM QUOTA")
+		fmt.Fprintln(w, "NAME\tACCESS\tGPU QUOTA\tCPU QUOTA\tMEM QUOTA")
 		for _, ws := range workspaces {
 			current := ""
 			if ws.Name == k8sClient.Namespace {
 				current = " (current)"
 			}
 			fmt.Fprintf(w, "%s%s\t%s\t%d\t%s\t%s\n",
-				ws.Name, current, ws.NodeGroup, ws.GPUQuota, ws.CPUQuota, ws.MemQuota)
+				ws.Name, current, formatWorkspaceAccess(ws.NodeGroup), ws.GPUQuota, ws.CPUQuota, ws.MemQuota)
 		}
 	} else {
-		fmt.Fprintln(w, "NAME\tNODE GROUP\tGPU QUOTA")
+		fmt.Fprintln(w, "NAME\tACCESS\tGPU QUOTA")
 		for _, ws := range workspaces {
 			current := ""
 			if ws.Name == k8sClient.Namespace {
 				current = " (current)"
 			}
-			fmt.Fprintf(w, "%s%s\t%s\t%d\n", ws.Name, current, ws.NodeGroup, ws.GPUQuota)
+			fmt.Fprintf(w, "%s%s\t%s\t%d\n", ws.Name, current, formatWorkspaceAccess(ws.NodeGroup), ws.GPUQuota)
 		}
 	}
 	w.Flush()
@@ -393,8 +408,8 @@ func getWorkspace(ctx context.Context, k8sClient *client.Client, name string, ve
 	}
 
 	fmt.Printf("Workspace: %s%s\n", ws.Name, current)
-	fmt.Printf("  Node Group: %s\n", ws.NodeGroup)
-	fmt.Printf("  GPU Quota:  %d\n", ws.GPUQuota)
+	fmt.Printf("  Access:    %s\n", formatWorkspaceAccess(ws.NodeGroup))
+	fmt.Printf("  GPU Quota: %d\n", ws.GPUQuota)
 	if verbose {
 		fmt.Printf("  CPU Quota:  %s\n", ws.CPUQuota)
 		fmt.Printf("  Mem Quota:  %s\n", ws.MemQuota)

@@ -13,14 +13,14 @@ var (
 	// Label keys
 	LabelManagedBy      = "app.kubernetes.io/managed-by"
 	LabelManagedByValue = "sgs"
-	LabelNodeName       = "sgs.bacchus.io/node-name"
-	LabelVolumeName     = "sgs.bacchus.io/volume-name"
-	LabelSessionMode    = "sgs.bacchus.io/session-mode"
+	LabelNodeName       = "sgs.snucse.org/node-name"
+	LabelVolumeName     = "sgs.snucse.org/volume-name"
+	LabelSessionMode    = "sgs.snucse.org/session-mode"
 	LabelWorkspaceID    = "sgs.snucse.org/id"
 
 	// Annotation keys
 	AnnotationSelectedNode = "volume.kubernetes.io/selected-node"
-	AnnotationOSImage      = "sgs.bacchus.io/os-image"
+	AnnotationOSImage      = "sgs.snucse.org/os-image"
 	AnnotationOSVolume     = "sgs.snucse.org/os-volume"
 	AnnotationNodeSelector = "scheduler.alpha.kubernetes.io/node-selector"
 

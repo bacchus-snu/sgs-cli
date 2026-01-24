@@ -6,15 +6,15 @@
 labels:
   managedBy: "app.kubernetes.io/managed-by"
   managedByValue: "sgs"
-  nodeName: "sgs.bacchus.io/node-name"
-  volumeName: "sgs.bacchus.io/volume-name"
-  sessionMode: "sgs.bacchus.io/session-mode"
+  nodeName: "sgs.snucse.org/node-name"
+  volumeName: "sgs.snucse.org/volume-name"
+  sessionMode: "sgs.snucse.org/session-mode"
   workspaceID: "sgs.snucse.org/id"
 
 # Annotation keys for SGS resources
 annotations:
   selectedNode: "volume.kubernetes.io/selected-node"
-  osImage: "sgs.bacchus.io/os-image"
+  osImage: "sgs.snucse.org/os-image"
   osVolume: "sgs.snucse.org/os-volume"
   nodeSelector: "scheduler.alpha.kubernetes.io/node-selector"
 

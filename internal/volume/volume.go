@@ -434,7 +434,7 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 			Namespace: namespace,
 			Labels: map[string]string{
 				sgs.LabelManagedBy:    "sgs",
-				"sgs.bacchus.io/mode": "init",
+				"sgs.snucse.org/mode": "init",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -1209,7 +1209,7 @@ func copySameNode(ctx context.Context, c *client.Client, nodeName, srcPVC, dstPV
 			Namespace: c.Namespace,
 			Labels: map[string]string{
 				sgs.LabelManagedBy:    "sgs",
-				"sgs.bacchus.io/mode": "copy",
+				"sgs.snucse.org/mode": "copy",
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -1445,7 +1445,7 @@ func createCopyPod(name, nodeName, pvcName, namespace string, readOnly bool) *co
 			Namespace: namespace,
 			Labels: map[string]string{
 				sgs.LabelManagedBy:    "sgs",
-				"sgs.bacchus.io/mode": "copy",
+				"sgs.snucse.org/mode": "copy",
 			},
 		},
 		Spec: corev1.PodSpec{

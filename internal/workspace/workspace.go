@@ -169,19 +169,30 @@ func Exists(ctx context.Context, c *client.Client, name string) bool {
 	return ok
 }
 
+// NodeGroup constants
+const (
+	NodeGroupGraduate     = "graduate"
+	NodeGroupUndergraduate = "undergraduate"
+)
+
 // CanAccessNode checks if the current workspace can access a node based on node group.
 // Returns true if access is allowed, false otherwise.
 // The nodeGroupLabel parameter is the value of "node-restriction.kubernetes.io/nodegroup" on the node.
 //
 // Access rules:
-// - Workspace node group must match node's node group exactly
-// - The Kubernetes admission controller enforces this by adding node selector to pods
+// - Graduate nodegroup workspaces (or no annotation) can access ALL nodes
+// - Undergraduate nodegroup workspaces can only access nodes with "undergraduate" label
 func CanAccessNode(workspaceNodeGroup, nodeGroupLabel string) bool {
-	// If workspace has no node group restriction, allow all
-	if workspaceNodeGroup == "" {
+	// Graduate workspaces or workspaces with no annotation can access all nodes
+	if workspaceNodeGroup == NodeGroupGraduate || workspaceNodeGroup == "" {
 		return true
 	}
 
-	// Workspace node group must match node's label exactly
+	// Undergraduate workspaces can only access nodes with undergraduate label
+	if workspaceNodeGroup == NodeGroupUndergraduate {
+		return nodeGroupLabel == NodeGroupUndergraduate
+	}
+
+	// For any other workspace node group, require exact match
 	return workspaceNodeGroup == nodeGroupLabel
 }
