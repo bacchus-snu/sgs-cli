@@ -267,9 +267,9 @@ func Get(ctx context.Context, c *client.Client, nodeName, volumeName string) (*V
 	}, nil
 }
 
-// Create creates a new volume
-// If Image is empty, creates a data volume (PVC only, for storage)
-// If Image is set, creates an OS volume (PVC + init pod that copies base files)
+// Create creates a new volume (PVC only)
+// If Image is set, stores the image in an annotation for the runtime wrapper to use,
+// and creates a binder pod to trigger PVC binding.
 func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 	// Validate node access before creating anything
 	if err := validateNodeAccess(ctx, c, opts.NodeName); err != nil {
@@ -293,7 +293,7 @@ func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 	// Create annotations
 	annotations := make(map[string]string)
 	if opts.Image != "" {
-		// OS volume - store image in annotation
+		// OS volume - store image in annotation for runtime wrapper
 		annotations[sgs.AnnotationOSImage] = opts.Image
 	}
 
@@ -322,9 +322,9 @@ func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 		return client.FormatK8sError(err, "create", "volume", c.Namespace)
 	}
 
-	// For OS volumes, create an init pod to bind PVC and copy base files
+	// For OS volumes, create a binder pod to trigger PVC binding and cache image
 	if opts.Image != "" {
-		// Register cleanup for PVC in case of interrupt during init
+		// Register cleanup for PVC in case of interrupt during binding
 		cleanup.Register(func(cleanupCtx context.Context) {
 			fmt.Fprint(os.Stderr, "Cleaning up volume...")
 			if err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(cleanupCtx, name, metav1.DeleteOptions{}); err != nil {
@@ -334,19 +334,19 @@ func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 			}
 		})
 
-		initPod := createInitPodSpec(name, opts.NodeName, opts.Image, c.Namespace)
-		podName := initPod.Name
-		_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, initPod, metav1.CreateOptions{})
+		binderPod := createBinderPodSpec(name, opts.NodeName, opts.Image, c.Namespace)
+		podName := binderPod.Name
+		_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, binderPod, metav1.CreateOptions{})
 		if err != nil {
 			// Cleanup PVC if pod creation fails
 			cleanup.Unregister()
 			_ = c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-			return client.FormatK8sError(err, "create", "volume initialization", c.Namespace)
+			return client.FormatK8sError(err, "create", "volume binding", c.Namespace)
 		}
 
-		// Register cleanup for init pod
+		// Register cleanup for binder pod
 		cleanup.Register(func(cleanupCtx context.Context) {
-			fmt.Fprint(os.Stderr, "Cleaning up init pod...")
+			fmt.Fprint(os.Stderr, "Cleaning up binder pod...")
 			if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{}); err != nil {
 				fmt.Fprintf(os.Stderr, " failed: %v\n", err)
 			} else {
@@ -354,23 +354,23 @@ func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 			}
 		})
 
-		// Wait for init pod to complete or fail
-		if err := waitForInitPod(ctx, c, podName, 5*time.Minute); err != nil {
+		// Wait for binder pod to complete (PVC will be bound)
+		if err := waitForBinderPod(ctx, c, podName, 5*time.Minute); err != nil {
 			// If interrupted, signal handler does cleanup - just wait and return
 			if cleanup.WasInterrupted() {
 				cleanup.WaitForCleanup()
 				return nil
 			}
 			// Cleanup on failure
-			cleanup.Unregister() // init pod
+			cleanup.Unregister() // binder pod
 			cleanup.Unregister() // PVC
 			_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 			_ = c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-			return fmt.Errorf("init failed: %w", err)
+			return fmt.Errorf("volume binding failed: %w", err)
 		}
 
-		// Success - unregister cleanups and delete init pod
-		cleanup.Unregister() // init pod
+		// Success - unregister cleanups and delete binder pod
+		cleanup.Unregister() // binder pod
 		cleanup.Unregister() // PVC
 		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	}
@@ -378,14 +378,14 @@ func Create(ctx context.Context, c *client.Client, opts CreateOptions) error {
 	return nil
 }
 
-// waitForInitPod waits for the init pod to complete successfully or fail
-func waitForInitPod(ctx context.Context, c *client.Client, podName string, timeout time.Duration) error {
+// waitForBinderPod waits for the binder pod to complete successfully or fail
+func waitForBinderPod(ctx context.Context, c *client.Client, podName string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
 		pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to get init pod: %w", err)
+			return fmt.Errorf("failed to get binder pod: %w", err)
 		}
 
 		switch pod.Status.Phase {
@@ -395,13 +395,13 @@ func waitForInitPod(ctx context.Context, c *client.Client, podName string, timeo
 			// Get reason from container status
 			for _, cs := range pod.Status.ContainerStatuses {
 				if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
-					return fmt.Errorf("init pod failed: %s", cs.State.Terminated.Reason)
+					return fmt.Errorf("binder pod failed: %s", cs.State.Terminated.Reason)
 				}
 				if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
-					return fmt.Errorf("init pod failed: %s - %s", cs.State.Waiting.Reason, cs.State.Waiting.Message)
+					return fmt.Errorf("binder pod failed: %s - %s", cs.State.Waiting.Reason, cs.State.Waiting.Message)
 				}
 			}
-			return fmt.Errorf("init pod failed")
+			return fmt.Errorf("binder pod failed")
 		case corev1.PodPending:
 			// Check for image pull errors
 			for _, cs := range pod.Status.ContainerStatuses {
@@ -421,12 +421,12 @@ func waitForInitPod(ctx context.Context, c *client.Client, podName string, timeo
 		}
 	}
 
-	return fmt.Errorf("timeout waiting for init pod to complete")
+	return fmt.Errorf("timeout waiting for volume binding")
 }
 
-// createInitPodSpec creates a pod that initializes the OS volume (copies base files, then exits)
-func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
-	podName := "init-" + pvcName
+// createBinderPodSpec creates a pod that binds the PVC and caches the image (no os-volume annotation)
+func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
+	podName := "bind-" + pvcName
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -434,8 +434,9 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 			Namespace: namespace,
 			Labels: map[string]string{
 				sgs.LabelManagedBy:    "sgs",
-				"sgs.snucse.org/mode": "init",
+				"sgs.snucse.org/mode": "bind",
 			},
+			// No os-volume annotation - runtime wrapper will not interfere
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{
@@ -443,7 +444,7 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 			},
 			Containers: []corev1.Container{
 				{
-					Name:  "init",
+					Name:  "bind",
 					Image: image,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
@@ -457,17 +458,16 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 					},
 					VolumeMounts: []corev1.VolumeMount{
 						{
-							Name:      "rootfs-storage",
-							MountPath: "/persistent_root",
+							Name:      "data",
+							MountPath: "/mnt/data",
 						},
 					},
-					Command: []string{"/bin/bash", "-c"},
-					Args:    []string{getInitCopyScript()},
+					Command: []string{"true"},
 				},
 			},
 			Volumes: []corev1.Volume{
 				{
-					Name: "rootfs-storage",
+					Name: "data",
 					VolumeSource: corev1.VolumeSource{
 						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 							ClaimName: pvcName,
@@ -478,31 +478,6 @@ func createInitPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 			RestartPolicy: corev1.RestartPolicyNever,
 		},
 	}
-}
-
-// getInitCopyScript returns script that only copies base files (no mounts, no privileged needed)
-func getInitCopyScript() string {
-	return `set -e
-TARGET="/persistent_root"
-
-if [ ! -d "$TARGET/etc" ]; then
-  echo "Copying base system files..."
-  for dir in bin etc lib lib64 sbin usr var root; do
-    if [ -d "/$dir" ]; then cp -a "/$dir" "$TARGET/"; fi
-  done
-  mkdir -p "$TARGET/dev" "$TARGET/proc" "$TARGET/sys" "$TARGET/tmp"
-  chmod 1777 "$TARGET/tmp"
-  mkdir -p "$TARGET/usr/local/nvidia" "$TARGET/usr/local/vgpu"
-  mkdir -p "$TARGET/usr/lib/firmware/nvidia"
-  mkdir -p "$TARGET/run/nvidia-persistenced"
-  mkdir -p "$TARGET/tmp/vgpulock"
-  echo "Base system files copied successfully"
-else
-  echo "Base system files already exist, skipping copy"
-fi
-
-echo "Init complete, volume is ready"
-`
 }
 
 // GetPVCInfo retrieves PVC info including OS image
@@ -749,8 +724,6 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 		})
 	}
 
-	runtimeClassName := "sgs"
-
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -762,12 +735,11 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 				sgs.LabelSessionMode: SessionModeEdit,
 			},
 			Annotations: map[string]string{
-				// Triggers sgs-runc-wrapper to swap Root.Path to this PVC
+				// Triggers sgs-runtime-wrapper to swap Root.Path to this PVC
 				sgs.AnnotationOSVolume: pvcName,
 			},
 		},
 		Spec: corev1.PodSpec{
-			RuntimeClassName: &runtimeClassName,
 			NodeSelector: map[string]string{
 				"kubernetes.io/hostname": nodeName,
 			},
@@ -870,8 +842,6 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus
 		container.Args = []string{strings.Join(command, " ")}
 	}
 
-	runtimeClassName := "sgs"
-
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -883,12 +853,11 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus
 				sgs.LabelSessionMode: SessionModeRun,
 			},
 			Annotations: map[string]string{
-				// Triggers sgs-runc-wrapper to swap Root.Path to this PVC
+				// Triggers sgs-runtime-wrapper to swap Root.Path to this PVC
 				sgs.AnnotationOSVolume: pvcName,
 			},
 		},
 		Spec: corev1.PodSpec{
-			RuntimeClassName: &runtimeClassName,
 			NodeSelector: map[string]string{
 				"kubernetes.io/hostname": nodeName,
 			},
