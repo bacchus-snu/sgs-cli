@@ -13,7 +13,7 @@ A command line interface for SNUCSE GPU Service. It provides a VM-like experienc
 
 ## Project Structure
 
-```
+```text
 sgs-cli/
 ├── cmd/
 │   └── sgs/              # Application entry point
@@ -28,7 +28,6 @@ sgs-cli/
 │   ├── user/             # User identity from OIDC tokens
 │   ├── volume/           # Volume and session management
 │   └── workspace/        # Workspace operations
-├── constants.yaml        # Configuration constants (downloaded by fetch)
 ├── go.mod
 ├── go.sum
 ├── Makefile
@@ -40,14 +39,10 @@ sgs-cli/
 SGS CLI downloads configuration files to `~/.sgs/` on first run or when `sgs fetch` is executed:
 
 - `~/.sgs/config.yaml` - Kubernetes kubeconfig for cluster access
-- `~/.sgs/constants.yaml` - Configuration constants (labels, annotations, defaults)
+- `~/.sgs/metadata.yaml` - CLI metadata (last fetch timestamp)
 - `~/.sgs/cache/` - Token cache for OIDC authentication
 
-The `constants.yaml` file is downloaded from this repository and contains configurable values like:
-
-- Kubernetes label and annotation keys
-- Default container images and resource limits
-- Runtime class configuration
+The configuration is automatically refreshed if more than 24 hours have passed since the last fetch.
 
 ## Prerequisites
 
@@ -55,6 +50,27 @@ The `constants.yaml` file is downloaded from this repository and contains config
 - Access to SNUCSE GPU Service
 
 ## Installation
+
+### Download Binary
+
+Download the latest binary for your platform from [GitHub Releases](https://github.com/bacchus-snu/sgs-cli/releases):
+
+```bash
+# Linux (amd64)
+curl -LO https://github.com/bacchus-snu/sgs-cli/releases/latest/download/sgs-linux-amd64
+chmod +x sgs-linux-amd64
+sudo mv sgs-linux-amd64 /usr/local/bin/sgs
+
+# macOS (Apple Silicon)
+curl -LO https://github.com/bacchus-snu/sgs-cli/releases/latest/download/sgs-darwin-arm64
+chmod +x sgs-darwin-arm64
+sudo mv sgs-darwin-arm64 /usr/local/bin/sgs
+
+# macOS (Intel)
+curl -LO https://github.com/bacchus-snu/sgs-cli/releases/latest/download/sgs-darwin-amd64
+chmod +x sgs-darwin-amd64
+sudo mv sgs-darwin-amd64 /usr/local/bin/sgs
+```
 
 ### From Source
 
@@ -69,6 +85,10 @@ make build
 ```bash
 make install
 ```
+
+### Auto-Update
+
+When running `sgs fetch`, the CLI automatically checks for new versions and offers to update.
 
 ## Build
 
@@ -91,11 +111,14 @@ make clean
 ### Initial Setup
 
 ```bash
-# Download cluster configuration
+# Download cluster configuration (also checks for CLI updates)
 sgs fetch
 
 # Set your workspace
 sgs set workspace <workspace-name>
+
+# Check CLI version
+sgs version
 ```
 
 ### List Resources

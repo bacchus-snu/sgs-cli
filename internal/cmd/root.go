@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/bacchus-snu/sgs-cli/internal/sgs"
 	"github.com/spf13/cobra"
 )
 
@@ -65,6 +66,14 @@ Examples:
   sgs delete session ferrari/os-volume         # Delete session`,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version number",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("sgs version %s\n", sgs.Version)
+	},
+}
+
 // Execute runs the root command
 func Execute() error {
 	return rootCmd.Execute()
@@ -79,6 +88,7 @@ func init() {
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(attachCmd)
 	rootCmd.AddCommand(fetchCmd)
+	rootCmd.AddCommand(versionCmd)
 }
 
 // exitWithError prints an error and exits with code 1.

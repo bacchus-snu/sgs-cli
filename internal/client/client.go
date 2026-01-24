@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/bacchus-snu/sgs-cli/internal/sgs"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -77,45 +76,84 @@ func configPath() string {
 	return filepath.Join(os.Getenv("HOME"), ".sgs", "config.yaml")
 }
 
-// constantsPath returns the path to the SGS constants file
-func constantsPath() string {
-	return filepath.Join(os.Getenv("HOME"), ".sgs", "constants.yaml")
+// metadataPath returns the path to the SGS metadata file
+func metadataPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".sgs", "metadata.yaml")
+}
+
+// Metadata stores CLI metadata like last fetch time
+type Metadata struct {
+	LastFetched time.Time `yaml:"last_fetched"`
+}
+
+// getLastFetched reads the last fetch time from metadata
+func getLastFetched() (time.Time, error) {
+	data, err := os.ReadFile(metadataPath())
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	var metadata Metadata
+	if err := yaml.Unmarshal(data, &metadata); err != nil {
+		return time.Time{}, err
+	}
+
+	return metadata.LastFetched, nil
+}
+
+// setLastFetched writes the current time to metadata
+func setLastFetched() error {
+	metadata := Metadata{
+		LastFetched: time.Now(),
+	}
+
+	data, err := yaml.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(metadataPath(), data, 0600)
+}
+
+// shouldAutoFetch returns true if 24+ hours have passed since last fetch
+func shouldAutoFetch() bool {
+	lastFetched, err := getLastFetched()
+	if err != nil {
+		// If we can't read metadata, don't auto-fetch
+		return false
+	}
+
+	return time.Since(lastFetched) >= 24*time.Hour
 }
 
 // configURL is the URL to download the kubeconfig from
 const configURL = "https://raw.githubusercontent.com/bacchus-snu/sgs/refs/heads/master/controller/config.yaml"
 
-// constantsURL is the URL to download the constants configuration from
-const constantsURL = "https://raw.githubusercontent.com/bacchus-snu/sgs-cli/refs/heads/main/constants.yaml"
-
-// EnsureConfig checks if config exists, if not, fetches it
+// EnsureConfig checks if config exists, if not, fetches it.
+// Also auto-fetches if 24+ hours have passed since last fetch.
 func EnsureConfig() error {
 	configFile := configPath()
-	constantsFile := constantsPath()
-
-	// Check if both configs already exist
-	configExists := true
-	constantsExists := true
 
 	if _, err := os.Stat(configFile); err != nil {
-		configExists = false
-	}
-	if _, err := os.Stat(constantsFile); err != nil {
-		constantsExists = false
+		// Config doesn't exist, fetch it
+		return FetchConfig()
 	}
 
-	if configExists && constantsExists {
-		return nil // Both configs exist
+	// Check if we should auto-fetch (24+ hours since last fetch)
+	if shouldAutoFetch() {
+		fmt.Println("Configuration is older than 24 hours, refreshing...")
+		if err := FetchConfig(); err != nil {
+			// Don't fail if auto-fetch fails, just warn
+			fmt.Printf("Warning: failed to refresh configuration: %v\n", err)
+		}
 	}
 
-	// One or both configs don't exist, fetch them
-	return FetchConfig()
+	return nil
 }
 
-// FetchConfig downloads the configuration files from GitHub and applies modifications
+// FetchConfig downloads the kubeconfig from GitHub
 func FetchConfig() error {
 	configFile := configPath()
-	constantsFile := constantsPath()
 
 	// Create directory if it doesn't exist
 	configDir := filepath.Dir(configFile)
@@ -129,7 +167,7 @@ func FetchConfig() error {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	// Download kubeconfig template
+	// Download kubeconfig
 	fmt.Println("Downloading cluster configuration from server...")
 
 	resp, err := http.Get(configURL)
@@ -147,43 +185,18 @@ func FetchConfig() error {
 		return fmt.Errorf("failed to read kubeconfig response: %w", err)
 	}
 
-	// Write the config directly (no modifications needed)
+	// Write the config
 	if err := os.WriteFile(configFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write kubeconfig: %w", err)
 	}
 
 	fmt.Println("Cluster configuration saved.")
 
-	// Download constants configuration
-	fmt.Println("Downloading CLI configuration from server...")
-
-	resp2, err := http.Get(constantsURL)
-	if err != nil {
-		fmt.Println("Warning: failed to download CLI configuration.")
-		fmt.Println("Using default configuration values.")
-	} else {
-		defer resp2.Body.Close()
-
-		if resp2.StatusCode != http.StatusOK {
-			fmt.Println("Warning: failed to download CLI configuration.")
-			fmt.Println("Using default configuration values.")
-		} else {
-			constantsData, err := io.ReadAll(resp2.Body)
-			if err != nil {
-				fmt.Println("Warning: failed to download CLI configuration.")
-				fmt.Println("Using default configuration values.")
-			} else {
-				if err := os.WriteFile(constantsFile, constantsData, 0600); err != nil {
-					return fmt.Errorf("failed to save configuration: %w", err)
-				}
-				fmt.Println("CLI configuration saved.")
-			}
-		}
+	// Update last fetched timestamp
+	if err := setLastFetched(); err != nil {
+		// Don't fail if we can't write metadata
+		fmt.Printf("Warning: failed to update metadata: %v\n", err)
 	}
-
-	// Reset and reload the SGS configuration (will use defaults if file doesn't exist)
-	sgs.ResetConfig()
-	_ = sgs.InitFromConfig() // Ignore errors, will use defaults
 
 	return nil
 }
@@ -193,11 +206,6 @@ func New() (*Client, error) {
 	// Ensure config exists
 	if err := EnsureConfig(); err != nil {
 		return nil, err
-	}
-
-	// Initialize SGS configuration from constants.yaml
-	if err := sgs.InitFromConfig(); err != nil {
-		return nil, fmt.Errorf("failed to initialize SGS config: %w", err)
 	}
 
 	kubeconfigPath := configPath()

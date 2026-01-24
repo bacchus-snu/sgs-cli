@@ -30,4 +30,7 @@ func runFetch(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("Configuration updated successfully")
+
+	// Check for CLI updates
+	client.PromptForUpdate()
 }
