@@ -980,10 +980,6 @@ func WaitForPodReady(ctx context.Context, c *client.Client, podName string, time
 
 // Attach attaches to a running pod with an interactive shell
 func Attach(ctx context.Context, c *client.Client, podName string, stdin io.Reader, stdout, stderr io.Writer) error {
-	// Run bash in the persistent root with proper environment
-	// This avoids needing chroot which requires bind mounts (privileged)
-	shellScript := `cd /persistent_root && export HOME=/persistent_root/root && export PATH="/persistent_root/usr/local/sbin:/persistent_root/usr/local/bin:/persistent_root/usr/sbin:/persistent_root/usr/bin:/persistent_root/sbin:/persistent_root/bin:$PATH" && exec /persistent_root/bin/bash`
-
 	req := c.Clientset.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
@@ -991,7 +987,7 @@ func Attach(ctx context.Context, c *client.Client, podName string, stdin io.Read
 		Namespace(c.Namespace).
 		SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
-			Command: []string{"/bin/bash", "-c", shellScript},
+			Command: []string{"/bin/bash"},
 			Stdin:   stdin != nil,
 			Stdout:  stdout != nil,
 			Stderr:  stderr != nil,
