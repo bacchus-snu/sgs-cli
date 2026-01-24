@@ -15,7 +15,6 @@ labels:
 annotations:
   selectedNode: "volume.kubernetes.io/selected-node"
   osImage: "sgs.snucse.org/os-image"
-  osVolume: "sgs.snucse.org/os-volume"
   nodeSelector: "scheduler.alpha.kubernetes.io/node-selector"
 
 # Session modes
@@ -37,5 +36,5 @@ editLimits:
   cpu: "4"
   memory: "16Gi"
 
-# Beacon mount path (where sgs-runc-wrapper finds the PVC)
-beaconMountPath: "/var/lib/sgs/boot"
+# Beacon mount path - runtime wrapper detects this path to trigger root swap
+beaconMountPath: "/sgs-os-volume"

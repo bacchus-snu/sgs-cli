@@ -36,7 +36,6 @@ type LabelsConfig struct {
 type AnnotationsConfig struct {
 	SelectedNode string `yaml:"selectedNode"`
 	OSImage      string `yaml:"osImage"`
-	OSVolume     string `yaml:"osVolume"`
 	NodeSelector string `yaml:"nodeSelector"`
 }
 
@@ -126,9 +125,6 @@ func (c *Config) validate() error {
 	}
 	if c.Annotations.OSImage == "" {
 		return fmt.Errorf("annotations.osImage is required")
-	}
-	if c.Annotations.OSVolume == "" {
-		return fmt.Errorf("annotations.osVolume is required")
 	}
 	if c.SessionModes.Edit == "" {
 		return fmt.Errorf("sessionModes.edit is required")

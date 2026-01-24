@@ -154,26 +154,11 @@ func List(ctx context.Context, c *client.Client) ([]VolumeInfo, error) {
 		osImage := pvc.Annotations[sgs.AnnotationOSImage]
 		isOSVolume := osImage != ""
 
-		// Check if there's an init pod (volume is being initialized)
-		initPodName := "init-" + pvc.Name
-		initPod, initErr := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, initPodName, metav1.GetOptions{})
-
-		// Check if there's an associated pod
+		// Check if there's an associated session pod
 		pod, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
 		status := string(pvc.Status.Phase) // Default to PVC status (Bound, Pending, etc.)
-
-		if initErr == nil {
-			// Init pod exists - show initializing status
-			switch initPod.Status.Phase {
-			case corev1.PodPending:
-				status = "Initializing"
-			case corev1.PodRunning:
-				status = "Initializing"
-			case corev1.PodFailed:
-				status = "InitFailed"
-			}
-		} else if err == nil {
-			// Regular pod exists, use pod status
+		if err == nil {
+			// Pod exists, use pod status
 			status = string(pod.Status.Phase)
 		}
 
@@ -424,7 +409,8 @@ func waitForBinderPod(ctx context.Context, c *client.Client, podName string, tim
 	return fmt.Errorf("timeout waiting for volume binding")
 }
 
-// createBinderPodSpec creates a pod that binds the PVC and caches the image (no os-volume annotation)
+// createBinderPodSpec creates a normal pod that binds the PVC and caches the image
+// This is a "normal" pod type - no root swap occurs because it mounts at /mnt/data (not /sgs-os-volume)
 func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 	podName := "bind-" + pvcName
 
@@ -436,7 +422,7 @@ func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod
 				sgs.LabelManagedBy:    "sgs",
 				"sgs.snucse.org/mode": "bind",
 			},
-			// No os-volume annotation - runtime wrapper will not interfere
+			// Normal pod - no special annotations needed
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{
@@ -685,20 +671,20 @@ func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, er
 	return &RunResult{PodName: podName}, nil
 }
 
-// createEditPodSpec creates a pod for edit mode (no GPU, limited resources)
-// Uses SGS RuntimeClass which swaps the container rootfs to the PVC via sgs-runc-wrapper
+// createEditPodSpec creates an edit pod (root swap enabled via /sgs-os-volume mount path)
+// The runtime wrapper detects the /sgs-os-volume mount path and swaps the container rootfs to the PVC
 func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mounts []MountOption, namespace string) *corev1.Pod {
 	// Build volume mounts and volumes
-	// The boot-volume mount is a "beacon" - sgs-runc-wrapper uses its source as the new Root.Path
+	// The /sgs-os-volume mount path triggers root swap by the runtime wrapper
 	volumeMounts := []corev1.VolumeMount{
 		{
-			Name:      "boot-volume",
-			MountPath: "/var/lib/sgs/boot",
+			Name:      "os-volume",
+			MountPath: sgs.BeaconMount, // "/sgs-os-volume"
 		},
 	}
 	volumes := []corev1.Volume{
 		{
-			Name: "boot-volume",
+			Name: "os-volume",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: pvcName,
@@ -734,10 +720,7 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 				sgs.LabelNodeName:    nodeName,
 				sgs.LabelSessionMode: SessionModeEdit,
 			},
-			Annotations: map[string]string{
-				// Triggers sgs-runtime-wrapper to swap Root.Path to this PVC
-				sgs.AnnotationOSVolume: pvcName,
-			},
+			// No annotations needed - runtime wrapper detects /sgs-os-volume mount path
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{
@@ -771,20 +754,20 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 	}
 }
 
-// createRunPodSpec creates a pod for run mode (with GPU)
-// Uses SGS RuntimeClass which swaps the container rootfs to the PVC via sgs-runc-wrapper
+// createRunPodSpec creates a run pod with GPU (root swap enabled via /sgs-os-volume mount path)
+// The runtime wrapper detects the /sgs-os-volume mount path and swaps the container rootfs to the PVC
 func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus int, gpuMem int64, cpuLimit, memLimit, cpuRequest, memRequest int64, command []string, mounts []MountOption, namespace string) *corev1.Pod {
 	// Build volume mounts and volumes
-	// The boot-volume mount is a "beacon" - sgs-runc-wrapper uses its source as the new Root.Path
+	// The /sgs-os-volume mount path triggers root swap by the runtime wrapper
 	volumeMounts := []corev1.VolumeMount{
 		{
-			Name:      "boot-volume",
-			MountPath: "/var/lib/sgs/boot",
+			Name:      "os-volume",
+			MountPath: sgs.BeaconMount, // "/sgs-os-volume"
 		},
 	}
 	volumes := []corev1.Volume{
 		{
-			Name: "boot-volume",
+			Name: "os-volume",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: pvcName,
@@ -852,10 +835,7 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus
 				sgs.LabelNodeName:    nodeName,
 				sgs.LabelSessionMode: SessionModeRun,
 			},
-			Annotations: map[string]string{
-				// Triggers sgs-runtime-wrapper to swap Root.Path to this PVC
-				sgs.AnnotationOSVolume: pvcName,
-			},
+			// No annotations needed - runtime wrapper detects /sgs-os-volume mount path
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{
@@ -868,19 +848,41 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus
 	}
 }
 
-// StopSession stops a session by deleting the pod
+// waitForPodDeleted waits for a pod to be fully deleted
+func waitForPodDeleted(ctx context.Context, c *client.Client, podName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		_, err := c.Clientset.CoreV1().Pods(c.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			return nil // Pod is deleted
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+			// continue polling
+		}
+	}
+
+	return fmt.Errorf("timeout waiting for pod deletion")
+}
+
+// StopSession stops a session by deleting the pod and waiting for deletion to complete
 func StopSession(ctx context.Context, c *client.Client, nodeName, volumeName string) error {
 	podName := sessionPodName(nodeName, volumeName)
 
 	err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return fmt.Errorf("no session found for volume %q", nodeName+"/"+volumeName)
+			return nil // Already deleted
 		}
 		return client.FormatK8sError(err, "stop", "session", c.Namespace)
 	}
 
-	return nil
+	// Wait for pod to be actually deleted
+	return waitForPodDeleted(ctx, c, podName, 2*time.Minute)
 }
 
 // Stop stops a running session by deleting the pod (keeps PVC intact)

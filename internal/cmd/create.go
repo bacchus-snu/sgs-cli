@@ -243,13 +243,11 @@ func runCreateSession(cmd *cobra.Command, args []string) {
 				fmt.Println("Aborted.")
 				return
 			}
-			// Delete existing session
+			// Delete existing session (waits for pod deletion)
 			if err := volume.StopSession(ctx, k8sClient, nodeName, volumeName); err != nil {
 				exitWithError("failed to stop existing session", err)
 			}
 			fmt.Println("Existing session stopped.")
-			// Wait for pod to be deleted
-			time.Sleep(2 * time.Second)
 		}
 	}
 

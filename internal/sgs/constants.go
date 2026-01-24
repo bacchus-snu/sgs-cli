@@ -21,7 +21,6 @@ var (
 	// Annotation keys
 	AnnotationSelectedNode = "volume.kubernetes.io/selected-node"
 	AnnotationOSImage      = "sgs.snucse.org/os-image"
-	AnnotationOSVolume     = "sgs.snucse.org/os-volume"
 	AnnotationNodeSelector = "scheduler.alpha.kubernetes.io/node-selector"
 
 	// Session modes
@@ -37,8 +36,8 @@ var (
 	EditCPULimit    = "4"
 	EditMemoryLimit = "16Gi"
 
-	// Beacon mount path
-	BeaconMount = "/var/lib/sgs/boot"
+	// Beacon mount path - the runtime wrapper detects this path to trigger root swap
+	BeaconMount = "/sgs-os-volume"
 )
 
 // InitFromConfig loads configuration from the config file and updates
@@ -63,7 +62,6 @@ func InitFromConfig() error {
 	// Update annotation keys
 	AnnotationSelectedNode = cfg.Annotations.SelectedNode
 	AnnotationOSImage = cfg.Annotations.OSImage
-	AnnotationOSVolume = cfg.Annotations.OSVolume
 	AnnotationNodeSelector = cfg.Annotations.NodeSelector
 
 	// Update session modes
@@ -111,7 +109,6 @@ func Annotations() AnnotationsConfig {
 		return AnnotationsConfig{
 			SelectedNode: AnnotationSelectedNode,
 			OSImage:      AnnotationOSImage,
-			OSVolume:     AnnotationOSVolume,
 			NodeSelector: AnnotationNodeSelector,
 		}
 	}
