@@ -50,10 +50,13 @@ fetch_versions() {
 # Interactive version selection
 select_version() {
   printf "${BLUE}Available versions:${NC}\n"
-  printf "  1) latest\n"
-  i=2
+  i=1
   for v in $RELEASES; do
-    printf "  %d) %s\n" "$i" "$v"
+    if [ "$i" = "1" ]; then
+      printf "  %d) %s (latest)\n" "$i" "$v"
+    else
+      printf "  %d) %s\n" "$i" "$v"
+    fi
     i=$((i + 1))
   done
 
@@ -61,11 +64,7 @@ select_version() {
   read -r choice </dev/tty
   choice=${choice:-1}
 
-  if [ "$choice" = "1" ]; then
-    VERSION="latest"
-  else
-    VERSION=$(echo "$RELEASES" | sed -n "$((choice - 1))p")
-  fi
+  VERSION=$(echo "$RELEASES" | sed -n "${choice}p")
 }
 
 # Select installation path
@@ -90,11 +89,7 @@ select_install_path() {
 
 # Download and install
 install_binary() {
-  if [ "$VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/sgs-$OS-$ARCH"
-  else
-    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/sgs-$OS-$ARCH"
-  fi
+  DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/sgs-$OS-$ARCH"
 
   # Add .exe for Windows
   if [ "$OS" = "windows" ]; then
@@ -153,11 +148,11 @@ main() {
 
   # Check if any releases exist
   if [ -z "$RELEASES" ]; then
-    printf "${YELLOW}No releases found. Installing latest...${NC}\n"
-    VERSION="latest"
-  else
-    select_version
+    printf "${RED}No releases found. Please check the repository.${NC}\n"
+    exit 1
   fi
+
+  select_version
 
   select_install_path
   install_binary

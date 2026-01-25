@@ -115,7 +115,7 @@ func setLastFetched() error {
 	return os.WriteFile(metadataPath(), data, 0600)
 }
 
-// shouldAutoFetch returns true if 24+ hours have passed since last fetch
+// shouldAutoFetch returns true if 7+ days have passed since last fetch
 func shouldAutoFetch() bool {
 	lastFetched, err := getLastFetched()
 	if err != nil {
@@ -123,14 +123,14 @@ func shouldAutoFetch() bool {
 		return false
 	}
 
-	return time.Since(lastFetched) >= 24*time.Hour
+	return time.Since(lastFetched) >= 7*24*time.Hour
 }
 
 // configURL is the URL to download the kubeconfig from
 const configURL = "https://raw.githubusercontent.com/bacchus-snu/sgs/refs/heads/master/controller/config.yaml"
 
 // EnsureConfig checks if config exists, if not, fetches it.
-// Also auto-fetches if 24+ hours have passed since last fetch.
+// Also auto-fetches if 7+ days have passed since last fetch.
 func EnsureConfig() error {
 	configFile := configPath()
 
@@ -139,12 +139,15 @@ func EnsureConfig() error {
 		return FetchConfig()
 	}
 
-	// Check if we should auto-fetch (24+ hours since last fetch)
+	// Check if we should auto-fetch (7+ days since last fetch)
 	if shouldAutoFetch() {
-		fmt.Println("Configuration is older than 24 hours, refreshing...")
+		fmt.Println("Configuration is older than 7 days, refreshing...")
 		if err := FetchConfig(); err != nil {
 			// Don't fail if auto-fetch fails, just warn
 			fmt.Printf("Warning: failed to refresh configuration: %v\n", err)
+		} else {
+			// Check for CLI updates (same as 'sgs fetch')
+			PromptForUpdate()
 		}
 	}
 

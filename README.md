@@ -42,7 +42,7 @@ SGS CLI downloads configuration files to `~/.sgs/` on first run or when `sgs fet
 - `~/.sgs/metadata.yaml` - CLI metadata (last fetch timestamp)
 - `~/.sgs/cache/` - Token cache for OIDC authentication
 
-The configuration is automatically refreshed if more than 24 hours have passed since the last fetch.
+The configuration is automatically refreshed if more than 7 days have passed since the last fetch.
 
 ## Prerequisites
 
@@ -83,7 +83,7 @@ make build && make install
 
 ### Auto-Update
 
-The CLI automatically runs `sgs fetch` when any command is executed and the last fetch was more than 24 hours ago. This checks for new versions and offers to update.
+The CLI automatically runs `sgs fetch` when any command is executed and the last fetch was more than 7 days ago. This checks for new versions and offers to update.
 
 ## Build
 
