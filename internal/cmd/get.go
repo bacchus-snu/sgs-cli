@@ -21,48 +21,24 @@ var getCmd = &cobra.Command{
 	Short: "Display resources",
 	Long: `Display one or more resources.
 
-Resource types:
-  all                - List all resources (nodes, volumes, sessions, workspaces)
-  nodes              - List all worker nodes in the cluster
-  node <name>        - Get details for a specific node
-  volumes            - List all volumes in current workspace
-  volume <node/vol>  - Get details for a specific volume
-  sessions           - List all running sessions (edit/run pods)
-  session <name>     - Get details for a specific session
-  workspaces         - List all accessible workspaces
-  current-workspace  - Get current workspace info
-  me                 - Show your user information
+Resource types (aliases):
+  all                 List all resources
+  me                  Show your user information
+  node (no)           Worker nodes in the cluster
+  session (se)        Running sessions (edit/run pods)
+  volume (vo, vol)    Volumes in current workspace
+  workspace (ws)      Accessible workspaces
+  current-workspace   Current workspace info
 
 Examples:
-  # List all resources
-  sgs get all
-
-  # List all worker nodes
-  sgs get nodes
-
-  # Get specific node info
-  sgs get node ferrari
-
-  # List all volumes in current workspace
-  sgs get volumes
-
-  # Get specific volume info
-  sgs get volume ferrari/my-volume
-
-  # List all running sessions
-  sgs get sessions
-
-  # Get specific session info
-  sgs get session edit-ferrari-my-volume
-
-  # List all accessible workspaces
-  sgs get workspaces
-
-  # Get current workspace info
-  sgs get current-workspace
-
-  # Show your user info
-  sgs get me`,
+  sgs get all                     # List all resources
+  sgs get no                      # List all nodes
+  sgs get node ferrari            # Get specific node info
+  sgs get vo                      # List all volumes
+  sgs get volume ferrari/my-vol   # Get specific volume info
+  sgs get se                      # List all sessions
+  sgs get ws                      # List all workspaces
+  sgs get me                      # Show your user info`,
 	Args: cobra.RangeArgs(1, 2),
 	Run:  runGet,
 }
@@ -84,25 +60,25 @@ func runGet(cmd *cobra.Command, args []string) {
 	switch resource {
 	case "all":
 		getAll(ctx, k8sClient, false)
-	case "nodes", "node":
+	case "nodes", "node", "no":
 		if name == "" {
 			getNodes(ctx, k8sClient, false)
 		} else {
 			getNode(ctx, k8sClient, name, false)
 		}
-	case "volumes", "volume":
+	case "volumes", "volume", "vo", "vol":
 		if name == "" {
 			getVolumes(ctx, k8sClient, false)
 		} else {
 			getVolume(ctx, k8sClient, name, false)
 		}
-	case "sessions", "session":
+	case "sessions", "session", "se":
 		if name == "" {
 			getSessions(ctx, k8sClient, false)
 		} else {
 			getSession(ctx, k8sClient, name, false)
 		}
-	case "workspaces", "workspace":
+	case "workspaces", "workspace", "ws":
 		if name == "" {
 			getWorkspaces(ctx, k8sClient, false)
 		} else {

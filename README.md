@@ -51,44 +51,39 @@ The configuration is automatically refreshed if more than 24 hours have passed s
 
 ## Installation
 
-### Download Binary
-
-Download the latest binary for your platform from [GitHub Releases](https://github.com/bacchus-snu/sgs-cli/releases):
+### Quick Install
 
 ```bash
-# Linux (amd64)
-curl -LO https://github.com/bacchus-snu/sgs-cli/releases/latest/download/sgs-linux-amd64
-chmod +x sgs-linux-amd64
-sudo mv sgs-linux-amd64 /usr/local/bin/sgs
-
-# macOS (Apple Silicon)
-curl -LO https://github.com/bacchus-snu/sgs-cli/releases/latest/download/sgs-darwin-arm64
-chmod +x sgs-darwin-arm64
-sudo mv sgs-darwin-arm64 /usr/local/bin/sgs
-
-# macOS (Intel)
-curl -LO https://github.com/bacchus-snu/sgs-cli/releases/latest/download/sgs-darwin-amd64
-chmod +x sgs-darwin-amd64
-sudo mv sgs-darwin-amd64 /usr/local/bin/sgs
+curl -fsSL https://raw.githubusercontent.com/bacchus-snu/sgs-cli/main/scripts/install.sh | sh
 ```
+
+Or with wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/bacchus-snu/sgs-cli/main/scripts/install.sh | sh
+```
+
+The installer will:
+
+- Auto-detect your OS and architecture
+- Show available versions to choose from
+- Let you select installation path (global `/usr/local/bin` or local `~/.local/bin`)
+
+### Manual Download
+
+Download binaries directly from [GitHub Releases](https://github.com/bacchus-snu/sgs-cli/releases).
 
 ### From Source
 
 ```bash
 git clone https://github.com/bacchus-snu/sgs-cli.git
 cd sgs-cli
-make build
-```
-
-### Install to PATH
-
-```bash
-make install
+make build && make install
 ```
 
 ### Auto-Update
 
-When running `sgs fetch`, the CLI automatically checks for new versions and offers to update.
+The CLI automatically runs `sgs fetch` when any command is executed and the last fetch was more than 24 hours ago. This checks for new versions and offers to update.
 
 ## Build
 

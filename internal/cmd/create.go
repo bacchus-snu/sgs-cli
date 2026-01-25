@@ -30,14 +30,15 @@ var (
 )
 
 var createCmd = &cobra.Command{
-	Use:   "create",
-	Short: "Create a resource",
+	Use:     "create",
+	Aliases: []string{"cr"},
+	Short:   "Create a resource (cr)",
 }
 
 var createVolumeCmd = &cobra.Command{
 	Use:     "volume <node-name>/<volume-name>",
-	Aliases: []string{"volumes"},
-	Short:   "Create a new volume",
+	Aliases: []string{"volumes", "vo", "vol"},
+	Short:   "Create a new volume (vo, vol)",
 	Long: `Create a new persistent volume on a specific node.
 
 There are two types of volumes:
@@ -68,13 +69,13 @@ Examples:
 
 var createSessionCmd = &cobra.Command{
 	Use:     "session <node>/<volume>",
-	Aliases: []string{"sessions"},
-	Short:   "Create a session on an OS volume",
+	Aliases: []string{"sessions", "se"},
+	Short:   "Create a session on an OS volume (se)",
 	Long: `Create a session on an OS volume.
 
 By default (or with --edit): Creates an edit session for interactive use.
   - Limited resources (4 CPU, 16GiB memory)
-  - GPU memory set to 0 (HAMi: drivers accessible, CUDA blocked)
+  - Minimal GPU memory (1 MiB) for nvidia-smi access, no CUDA compute
   - Use --attach to attach to shell immediately
 
 With --run flag: Creates a run session for GPU workloads.
@@ -83,7 +84,7 @@ With --run flag: Creates a run session for GPU workloads.
   - CPU/memory automatically calculated based on GPU count
   - Use --pin-cpu and --pin-mem to pin resources
 
-You can mount additional volumes using the --mount flag.
+You can mount volumes using the --mount flag (both OS and data volumes supported).
 
 Examples:
   # Start an edit session

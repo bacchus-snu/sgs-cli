@@ -12,8 +12,9 @@ import (
 )
 
 var attachCmd = &cobra.Command{
-	Use:   "attach <node>/<volume>",
-	Short: "Attach to an existing session",
+	Use:     "attach <node>/<volume>",
+	Aliases: []string{"at"},
+	Short:   "Attach to an existing session (at)",
 	Long: `Attach to an existing session (edit or run pod).
 
 This command waits for the session pod to be ready and then attaches to it.

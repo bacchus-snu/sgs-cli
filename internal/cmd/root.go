@@ -16,59 +16,43 @@ var rootCmd = &cobra.Command{
 	Long: `SGS is a command line interface for SNUCSE GPU Service.
 It provides a VM-like experience for GPU computing on Kubernetes.
 
-Resource Types:
-  workspace - Your namespace for organizing volumes and sessions
-  node      - Worker nodes in the GPU cluster
-  volume    - Persistent storage (OS volumes and data volumes)
-  session   - Running pods (edit and run modes)
+Resource Types (aliases):
+  all                 All resources
+  node (no)           Worker nodes in the GPU cluster
+  session (se)        Running pods (edit and run modes)
+  volume (vo, vol)    Persistent storage (OS volumes and data volumes)
+  workspace (ws)      Your space for volumes, sessions, and resource quotas
 
-Commands:
-  fetch              - Download cluster configuration
-  set workspace      - Set current workspace
-  get                - List resources (nodes, volumes, sessions, workspaces)
-  create volume      - Create a new volume
-  create session     - Create a session (edit or run)
-  cp                 - Copy a volume to another location
-  delete volume      - Delete a volume
-  delete session     - Delete a session
-  logs               - View session logs
-  attach             - Attach to an existing session
+Volume Types:
+  os    Bootable volume with container image overlay (for sessions)
+  data  Storage-only volume for datasets and models
 
 Session Types:
-  Edit session: Interactive shell, no GPU, for code editing (default)
-  Run session:  GPU workloads with specified command (--run flag)
+  edit  Interactive shell, no GPU, for code editing (default)
+  run   GPU workloads with specified command (--run flag)
 
-Note: Only one session can exist per volume at a time.
-To switch from edit to run mode (or vice versa), you'll be prompted to confirm.
+Notes:
+  - Sessions can only be created from OS volumes (not data volumes)
+  - Only one session can be created from an OS volume at a time
+  - Both OS and data volumes can be mounted on multiple sessions simultaneously
 
 Examples:
-  # Initial setup
-  sgs fetch                                 # Download cluster config
-  sgs set workspace <name>                  # Set your workspace
-
-  # List resources
-  sgs get workspaces                        # List accessible workspaces
-  sgs get nodes                             # List available nodes
-  sgs get volumes                           # List your volumes
-  sgs get sessions                          # List running sessions
-
-  # Create and use volumes
-  sgs create volume ferrari/os-volume --image  # Create OS volume
-  sgs cp ferrari/os-volume porsche/os-volume   # Copy volume to another node
-  sgs create session ferrari/os-volume         # Start edit session (shell)
-  sgs create session ferrari/os-volume --run --gpu-num 2 --gpu-mem 8192 --command "python train.py"
-
-  # Attach to existing session
-  sgs attach ferrari/os-volume
-
-  # Manage sessions
-  sgs logs ferrari/os-volume                   # View session logs
-  sgs delete session ferrari/os-volume         # Delete session`,
+  sgs fetch                              # Download cluster config
+  sgs set workspace <name>               # Set your workspace
+  sgs get nodes                          # List available nodes (or: sgs get no)
+  sgs get volumes                        # List your volumes (or: sgs get vo)
+  sgs create volume ferrari/os --image   # Create OS volume
+  sgs create session ferrari/os          # Start edit session
+  sgs create session ferrari/os --run --gpu-num 2 --command "python train.py"
+  sgs attach ferrari/os                  # Attach to session (or: sgs at ferrari/os)
+  sgs logs ferrari/os                    # View logs (or: sgs log ferrari/os)
+  sgs delete session ferrari/os          # Delete session`,
 }
 
 var versionCmd = &cobra.Command{
-	Use:   "version",
-	Short: "Print the version number",
+	Use:     "version",
+	Aliases: []string{"ver"},
+	Short:   "Print the version number (ver)",
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Printf("sgs version %s\n", sgs.Version)
 	},
@@ -80,6 +64,9 @@ func Execute() error {
 }
 
 func init() {
+	// Disable the default "help" subcommand (use --help flag instead)
+	rootCmd.SetHelpCommand(&cobra.Command{Hidden: true})
+
 	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(describeCmd)
 	rootCmd.AddCommand(createCmd)

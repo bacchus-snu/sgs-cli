@@ -9,52 +9,29 @@ import (
 )
 
 var describeCmd = &cobra.Command{
-	Use:   "describe <resource> [name]",
-	Short: "Show detailed information about resources",
+	Use:     "describe <resource> [name]",
+	Aliases: []string{"des", "desc"},
+	Short:   "Show detailed information about resources (des, desc)",
 	Long: `Show detailed information about a resource.
 
-Resource types:
-  all                - Describe all resources (nodes, volumes, sessions, workspaces)
-  nodes              - Describe all worker nodes with detailed info
-  node <name>        - Describe a specific node
-  volumes            - Describe all volumes with detailed info
-  volume <name>      - Describe a specific volume
-  sessions           - Describe all sessions with detailed info
-  session <name>     - Describe a specific session
-  workspaces         - Describe all accessible workspaces
-  workspace [name]   - Describe current workspace or specific workspace
-  me                 - Show your user information
+Resource types (aliases):
+  all                 Describe all resources
+  me                  Show your user information
+  node (no)           Worker nodes with detailed info
+  session (se)        Sessions with detailed info
+  volume (vo, vol)    Volumes with detailed info
+  workspace (ws)      Workspaces with detailed info
 
 Examples:
-  # Describe all resources
-  sgs describe all
-
-  # Describe all worker nodes
-  sgs describe nodes
-
-  # Describe a specific node
-  sgs describe node ferrari
-
-  # Describe all volumes in current workspace
-  sgs describe volumes
-
-  # Describe a specific volume
-  sgs describe volume my-volume
-
-  # Describe all sessions
-  sgs describe sessions
-
-  # Describe a specific session
-  sgs describe session edit-my-volume
-
-  # Describe all accessible workspaces
-  sgs describe workspaces
-
-  # Describe current workspace
-  sgs describe workspace
-
-  # Show your user info
-  sgs describe me`,
+  sgs des all                     # Describe all resources
+  sgs des me                      # Show your user info
+  sgs des no                      # Describe all nodes
+  sgs des node ferrari            # Describe specific node
+  sgs des se                      # Describe all sessions
+  sgs des vo                      # Describe all volumes
+  sgs des volume ferrari/my-vol   # Describe specific volume
+  sgs des ws                      # Describe all workspaces
+  sgs des workspace               # Describe current workspace`,
 	Args: cobra.RangeArgs(1, 2),
 	Run:  runDescribe,
 }
@@ -76,25 +53,25 @@ func runDescribe(cmd *cobra.Command, args []string) {
 	switch resource {
 	case "all":
 		getAll(ctx, k8sClient, true)
-	case "nodes", "node":
+	case "nodes", "node", "no":
 		if name == "" {
 			getNodes(ctx, k8sClient, true)
 		} else {
 			getNode(ctx, k8sClient, name, true)
 		}
-	case "volumes", "volume":
+	case "volumes", "volume", "vo", "vol":
 		if name == "" {
 			getVolumes(ctx, k8sClient, true)
 		} else {
 			getVolume(ctx, k8sClient, name, true)
 		}
-	case "sessions", "session":
+	case "sessions", "session", "se":
 		if name == "" {
 			getSessions(ctx, k8sClient, true)
 		} else {
 			getSession(ctx, k8sClient, name, true)
 		}
-	case "workspaces", "workspace":
+	case "workspaces", "workspace", "ws":
 		if name == "" {
 			getWorkspaces(ctx, k8sClient, true)
 		} else {

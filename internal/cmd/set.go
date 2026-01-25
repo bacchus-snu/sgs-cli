@@ -14,14 +14,13 @@ var setCmd = &cobra.Command{
 
 var setWorkspaceCmd = &cobra.Command{
 	Use:     "workspace <workspace-name>",
-	Aliases: []string{"workspaces"},
-	Short:   "Set the current workspace",
-	Long: `Set the current workspace (Kubernetes namespace).
+	Aliases: []string{"workspaces", "ws"},
+	Short:   "Set the current workspace (ws)",
+	Long: `Set the current workspace.
 
 The workspace is stored in ~/.sgs/config.yaml and used for all subsequent commands.
 
 Examples:
-  # Set workspace
   sgs set workspace my-project`,
 	Args: cobra.ExactArgs(1),
 	Run:  runSetWorkspace,

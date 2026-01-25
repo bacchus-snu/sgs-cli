@@ -8,8 +8,9 @@ import (
 )
 
 var fetchCmd = &cobra.Command{
-	Use:   "fetch",
-	Short: "Fetch or update the configuration",
+	Use:     "fetch",
+	Aliases: []string{"fet"},
+	Short:   "Fetch or update the configuration (fet)",
 	Long: `Fetch the configuration file from the server.
 
 This command downloads the latest configuration and saves it to ~/.sgs/config.yaml.

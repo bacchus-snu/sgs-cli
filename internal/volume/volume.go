@@ -87,6 +87,28 @@ type RunOptions struct {
 type MountOption struct {
 	SourceVolume string // Source PVC name
 	MountPath    string // Path inside container
+	IsOSVolume   bool   // True if source is OS volume (needs subPath for mounting)
+}
+
+// ValidateMounts checks that all mounts exist and marks which are OS volumes.
+// OS volumes are allowed to be mounted - they will use subPath: "upper" to expose
+// only the user's filesystem (hiding overlayfs internals like work/, merged/).
+func ValidateMounts(ctx context.Context, c *client.Client, mounts []MountOption) ([]MountOption, error) {
+	result := make([]MountOption, len(mounts))
+	for i, m := range mounts {
+		// Get PVC to check if it exists and if it's an OS volume
+		pvc, err := c.Clientset.CoreV1().PersistentVolumeClaims(c.Namespace).Get(ctx, m.SourceVolume, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("mount volume %q not found", m.SourceVolume)
+		}
+
+		result[i] = MountOption{
+			SourceVolume: m.SourceVolume,
+			MountPath:    m.MountPath,
+			IsOSVolume:   pvc.Annotations[sgs.AnnotationOSImage] != "",
+		}
+	}
+	return result, nil
 }
 
 // LogsOptions holds options for getting logs
@@ -113,6 +135,49 @@ func ParseVolumePath(path string) (nodeName, volumeName string, err error) {
 // FormatVolumePath formats node and volume into "node/volume" display format
 func FormatVolumePath(nodeName, volumeName string) string {
 	return nodeName + "/" + volumeName
+}
+
+// CopyPath represents a parsed copy source or destination
+// Supports both "node/volume" (volume copy) and "node/volume:path" (file/directory copy)
+type CopyPath struct {
+	NodeName   string
+	VolumeName string
+	Path       string // Empty for volume copy
+}
+
+// ParseCopyPath parses "node/volume" or "node/volume:path" into CopyPath
+// For volume copy (no path), Path will be empty
+// For file/directory copy (with path), Path will be the specified path
+func ParseCopyPath(arg string) (*CopyPath, error) {
+	// Check for colon to determine if path is specified
+	var volumePart, pathPart string
+	if colonIdx := strings.Index(arg, ":"); colonIdx != -1 {
+		volumePart = arg[:colonIdx]
+		pathPart = arg[colonIdx+1:]
+		if pathPart == "" {
+			return nil, fmt.Errorf("path cannot be empty after colon")
+		}
+	} else {
+		volumePart = arg
+		pathPart = ""
+	}
+
+	// Parse node/volume
+	nodeName, volumeName, err := ParseVolumePath(volumePart)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CopyPath{
+		NodeName:   nodeName,
+		VolumeName: volumeName,
+		Path:       pathPart,
+	}, nil
+}
+
+// IsFineGrained returns true if this is a file/directory copy (has path)
+func (cp *CopyPath) IsFineGrained() bool {
+	return cp.Path != ""
 }
 
 // List returns all volumes (PVCs) in the current namespace
@@ -409,8 +474,10 @@ func waitForBinderPod(ctx context.Context, c *client.Client, podName string, tim
 	return fmt.Errorf("timeout waiting for volume binding")
 }
 
-// createBinderPodSpec creates a normal pod that binds the PVC and caches the image
-// This is a "normal" pod type - no root swap occurs because it mounts at /mnt/data (not /sgs-os-volume)
+// createBinderPodSpec creates a binder pod that initializes the OS volume's overlayfs structure.
+// The pod mounts at /sgs-os-volume (beacon path) which triggers the runtime wrapper to create
+// the overlayfs directories (upper/, work/, merged/). This is required for subPath mounting to work.
+// The pod name prefix "bind-" ensures sgs-cli doesn't detect it as a session.
 func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod {
 	podName := "bind-" + pvcName
 
@@ -422,7 +489,6 @@ func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod
 				sgs.LabelManagedBy:    "sgs",
 				"sgs.snucse.org/mode": "bind",
 			},
-			// Normal pod - no special annotations needed
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{
@@ -444,8 +510,8 @@ func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod
 					},
 					VolumeMounts: []corev1.VolumeMount{
 						{
-							Name:      "data",
-							MountPath: "/mnt/data",
+							Name:      "os-volume",
+							MountPath: sgs.BeaconMount, // "/sgs-os-volume" - triggers runtime wrapper
 						},
 					},
 					Command: []string{"true"},
@@ -453,7 +519,7 @@ func createBinderPodSpec(pvcName, nodeName, image, namespace string) *corev1.Pod
 			},
 			Volumes: []corev1.Volume{
 				{
-					Name: "data",
+					Name: "os-volume",
 					VolumeSource: corev1.VolumeSource{
 						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 							ClaimName: pvcName,
@@ -551,6 +617,12 @@ func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult,
 		return nil, err
 	}
 
+	// Validate mounts exist and mark which are OS volumes (for subPath mounting)
+	mounts, err := ValidateMounts(ctx, c, opts.Mounts)
+	if err != nil {
+		return nil, err
+	}
+
 	podName := sessionPodName(opts.NodeName, opts.VolumeName)
 	pvc := pvcName(opts.NodeName, opts.VolumeName)
 
@@ -583,7 +655,7 @@ func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult,
 	}
 
 	// Create pod with edit mode resources
-	pod := createEditPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, opts.Mounts, c.Namespace)
+	pod := createEditPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, mounts, c.Namespace)
 
 	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -598,6 +670,12 @@ func Edit(ctx context.Context, c *client.Client, opts EditOptions) (*EditResult,
 func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, error) {
 	// Validate node access
 	if err := validateNodeAccess(ctx, c, opts.NodeName); err != nil {
+		return nil, err
+	}
+
+	// Validate mounts exist and mark which are OS volumes (for subPath mounting)
+	mounts, err := ValidateMounts(ctx, c, opts.Mounts)
+	if err != nil {
 		return nil, err
 	}
 
@@ -661,7 +739,7 @@ func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, er
 	}
 
 	// Create pod with GPU resources
-	pod := createRunPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, opts.GPUs, opts.GPUMem, cpuLimit, memLimit, cpuRequest, memRequest, opts.Command, opts.Mounts, c.Namespace)
+	pod := createRunPodSpec(podName, pvc, opts.NodeName, opts.VolumeName, osImage, opts.GPUs, opts.GPUMem, cpuLimit, memLimit, cpuRequest, memRequest, opts.Command, mounts, c.Namespace)
 
 	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -671,10 +749,43 @@ func Run(ctx context.Context, c *client.Client, opts RunOptions) (*RunResult, er
 	return &RunResult{PodName: podName}, nil
 }
 
+// buildMountSpecs converts MountOptions into Kubernetes VolumeMount and Volume specs.
+// For OS volumes, it adds SubPath: "upper" to expose only the user's filesystem
+// (hiding overlayfs internals like work/, merged/).
+func buildMountSpecs(mounts []MountOption) ([]corev1.VolumeMount, []corev1.Volume) {
+	var volumeMounts []corev1.VolumeMount
+	var volumes []corev1.Volume
+
+	for i, m := range mounts {
+		volName := fmt.Sprintf("mount-%d", i)
+
+		mount := corev1.VolumeMount{
+			Name:      volName,
+			MountPath: m.MountPath,
+		}
+		if m.IsOSVolume {
+			mount.SubPath = "upper" // Mount only upper/ for OS volumes
+		}
+		volumeMounts = append(volumeMounts, mount)
+
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: m.SourceVolume,
+				},
+			},
+		})
+	}
+	return volumeMounts, volumes
+}
+
 // createEditPodSpec creates an edit pod (root swap enabled via /sgs-os-volume mount path)
 // The runtime wrapper detects the /sgs-os-volume mount path and swaps the container rootfs to the PVC
 func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mounts []MountOption, namespace string) *corev1.Pod {
-	// Build volume mounts and volumes
+	// Build volume mounts and volumes for additional mounts (with subPath for OS volumes)
+	additionalMounts, additionalVolumes := buildMountSpecs(mounts)
+
 	// The /sgs-os-volume mount path triggers root swap by the runtime wrapper
 	volumeMounts := []corev1.VolumeMount{
 		{
@@ -682,6 +793,8 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 			MountPath: sgs.BeaconMount, // "/sgs-os-volume"
 		},
 	}
+	volumeMounts = append(volumeMounts, additionalMounts...)
+
 	volumes := []corev1.Volume{
 		{
 			Name: "os-volume",
@@ -692,23 +805,7 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 			},
 		},
 	}
-
-	// Add additional mounts
-	for i, m := range mounts {
-		volName := fmt.Sprintf("mount-%d", i)
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      volName,
-			MountPath: m.MountPath,
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: volName,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: m.SourceVolume,
-				},
-			},
-		})
-	}
+	volumes = append(volumes, additionalVolumes...)
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -739,7 +836,7 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 							corev1.ResourceCPU:                       resource.MustParse(sgs.EditCPULimit),
 							corev1.ResourceMemory:                    resource.MustParse(sgs.EditMemoryLimit),
 							corev1.ResourceName("nvidia.com/gpu"):    resource.MustParse("1"),
-							corev1.ResourceName("nvidia.com/gpumem"): resource.MustParse("0"),
+							corev1.ResourceName("nvidia.com/gpumem"): resource.MustParse("1"),
 						},
 					},
 					VolumeMounts: volumeMounts,
@@ -757,7 +854,9 @@ func createEditPodSpec(podName, pvcName, nodeName, volumeName, image string, mou
 // createRunPodSpec creates a run pod with GPU (root swap enabled via /sgs-os-volume mount path)
 // The runtime wrapper detects the /sgs-os-volume mount path and swaps the container rootfs to the PVC
 func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus int, gpuMem int64, cpuLimit, memLimit, cpuRequest, memRequest int64, command []string, mounts []MountOption, namespace string) *corev1.Pod {
-	// Build volume mounts and volumes
+	// Build volume mounts and volumes for additional mounts (with subPath for OS volumes)
+	additionalMounts, additionalVolumes := buildMountSpecs(mounts)
+
 	// The /sgs-os-volume mount path triggers root swap by the runtime wrapper
 	volumeMounts := []corev1.VolumeMount{
 		{
@@ -765,6 +864,8 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus
 			MountPath: sgs.BeaconMount, // "/sgs-os-volume"
 		},
 	}
+	volumeMounts = append(volumeMounts, additionalMounts...)
+
 	volumes := []corev1.Volume{
 		{
 			Name: "os-volume",
@@ -775,23 +876,7 @@ func createRunPodSpec(podName, pvcName, nodeName, volumeName, image string, gpus
 			},
 		},
 	}
-
-	// Add additional mounts
-	for i, m := range mounts {
-		volName := fmt.Sprintf("mount-%d", i)
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      volName,
-			MountPath: m.MountPath,
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: volName,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: m.SourceVolume,
-				},
-			},
-		})
-	}
+	volumes = append(volumes, additionalVolumes...)
 
 	// Determine if this is interactive mode (no command) or batch mode (with command)
 	interactive := len(command) == 0
@@ -1016,8 +1101,10 @@ func Attach(ctx context.Context, c *client.Client, podName string, stdin io.Read
 type CopyOptions struct {
 	SrcNode   string
 	SrcVolume string
+	SrcPath   string // Empty for volume copy (entire volume)
 	DstNode   string
 	DstVolume string
+	DstPath   string // Empty for volume copy (entire volume)
 }
 
 // validateNodeAccess checks if the current workspace can access a specific node
@@ -1296,8 +1383,8 @@ func copyCrossNode(ctx context.Context, c *client.Client, srcNode, dstNode, srcP
 
 	fmt.Println("Copying volume contents (cross-node via tar stream)...")
 
-	// Create source reader pod
-	srcPod := createCopyPod(srcPodName, srcNode, srcPVC, c.Namespace, true)
+	// Create source reader pod (no subPath - copy entire PVC for volume copy)
+	srcPod := createCopyPod(srcPodName, srcNode, srcPVC, c.Namespace, true, false)
 	_, err := c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, srcPod, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to create source pod: %w", err)
@@ -1316,8 +1403,8 @@ func copyCrossNode(ctx context.Context, c *client.Client, srcNode, dstNode, srcP
 		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), srcPodName, metav1.DeleteOptions{})
 	}()
 
-	// Create destination writer pod
-	dstPod := createCopyPod(dstPodName, dstNode, dstPVC, c.Namespace, false)
+	// Create destination writer pod (no subPath - copy entire PVC for volume copy)
+	dstPod := createCopyPod(dstPodName, dstNode, dstPVC, c.Namespace, false, false)
 	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, dstPod, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to create destination pod: %w", err)
@@ -1407,8 +1494,14 @@ func copyCrossNode(ctx context.Context, c *client.Client, srcNode, dstNode, srcP
 	return nil
 }
 
-// createCopyPod creates a pod for cross-node copy (long-running sleep)
-func createCopyPod(name, nodeName, pvcName, namespace string, readOnly bool) *corev1.Pod {
+// createCopyPod creates a pod for cross-node copy (long-running sleep).
+// Uses subPath: "upper" for OS volumes to expose only the user's filesystem.
+func createCopyPod(name, nodeName, pvcName, namespace string, readOnly, isOSVolume bool) *corev1.Pod {
+	mount := corev1.VolumeMount{Name: "data", MountPath: "/data", ReadOnly: readOnly}
+	if isOSVolume {
+		mount.SubPath = "upper" // Mount only upper/ for OS volumes
+	}
+
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -1436,11 +1529,9 @@ func createCopyPod(name, nodeName, pvcName, namespace string, readOnly bool) *co
 							corev1.ResourceMemory: resource.MustParse(sgs.EditMemoryLimit),
 						},
 					},
-					VolumeMounts: []corev1.VolumeMount{
-						{Name: "data", MountPath: "/data", ReadOnly: readOnly},
-					},
-					Command: []string{"/bin/sh", "-c"},
-					Args:    []string{"sleep 3600"}, // Stay alive for exec
+					VolumeMounts: []corev1.VolumeMount{mount},
+					Command:      []string{"/bin/sh", "-c"},
+					Args:         []string{"sleep 3600"}, // Stay alive for exec
 				},
 			},
 			Volumes: []corev1.Volume{
@@ -1583,4 +1674,287 @@ func execInPod(ctx context.Context, c *client.Client, podName string, command []
 		Stderr: stderr,
 		Tty:    false,
 	})
+}
+
+
+// CopyFiles copies specific files or directories between existing volumes
+// Both source and destination volumes must exist
+func CopyFiles(ctx context.Context, c *client.Client, opts CopyOptions) error {
+	// Validate source volume exists
+	srcInfo, err := Get(ctx, c, opts.SrcNode, opts.SrcVolume)
+	if err != nil {
+		return fmt.Errorf("source volume %s/%s not found", opts.SrcNode, opts.SrcVolume)
+	}
+
+	// Validate destination volume exists (required for file/directory copy)
+	dstInfo, err := Get(ctx, c, opts.DstNode, opts.DstVolume)
+	if err != nil {
+		return fmt.Errorf("destination volume %s/%s not found (for file/directory copy, both volumes must exist)", opts.DstNode, opts.DstVolume)
+	}
+
+	// Check for active sessions on source
+	srcMode, err := GetSessionMode(ctx, c, opts.SrcNode, opts.SrcVolume)
+	if err != nil {
+		return fmt.Errorf("failed to check source session: %w", err)
+	}
+	if srcMode != "" {
+		return fmt.Errorf("source volume %s/%s has an active session, please delete it first", opts.SrcNode, opts.SrcVolume)
+	}
+
+	// Check for active sessions on destination
+	dstMode, err := GetSessionMode(ctx, c, opts.DstNode, opts.DstVolume)
+	if err != nil {
+		return fmt.Errorf("failed to check destination session: %w", err)
+	}
+	if dstMode != "" {
+		return fmt.Errorf("destination volume %s/%s has an active session, please delete it first", opts.DstNode, opts.DstVolume)
+	}
+
+	srcPVCName := pvcName(opts.SrcNode, opts.SrcVolume)
+	dstPVCName := pvcName(opts.DstNode, opts.DstVolume)
+
+	// Normalize paths (remove leading slash)
+	srcPath := strings.TrimPrefix(opts.SrcPath, "/")
+	dstPath := strings.TrimPrefix(opts.DstPath, "/")
+
+	if opts.SrcNode == opts.DstNode {
+		// Same node: single pod with both volumes (uses subPath for OS volumes)
+		return copyPathSameNode(ctx, c, opts.SrcNode, srcPVCName, srcPath, srcInfo.IsOSVolume, dstPVCName, dstPath, dstInfo.IsOSVolume)
+	}
+	// Different nodes: stream between pods (uses subPath for OS volumes)
+	return copyPathCrossNode(ctx, c, opts.SrcNode, srcPVCName, srcPath, srcInfo.IsOSVolume, opts.DstNode, dstPVCName, dstPath, dstInfo.IsOSVolume)
+}
+
+// copyPathSameNode copies a specific path on the same node using a single pod.
+// Uses subPath: "upper" for OS volumes to expose only the user's filesystem.
+func copyPathSameNode(ctx context.Context, c *client.Client, nodeName, srcPVC, srcPath string, srcIsOS bool, dstPVC, dstPath string, dstIsOS bool) error {
+	podName := "copy-path-" + dstPVC
+	fmt.Printf("Copying %s to %s (same node)...\n", srcPath, dstPath)
+
+	// Build copy command that handles both files and directories
+	copyCmd := fmt.Sprintf(
+		"mkdir -p /dst/%s && cp -a /src/%s /dst/%s",
+		dstPath,
+		srcPath,
+		dstPath,
+	)
+
+	// Build volume mounts with subPath for OS volumes
+	srcMount := corev1.VolumeMount{Name: "src", MountPath: "/src", ReadOnly: true}
+	if srcIsOS {
+		srcMount.SubPath = "upper" // Mount only upper/ for OS volumes
+	}
+
+	dstMount := corev1.VolumeMount{Name: "dst", MountPath: "/dst"}
+	if dstIsOS {
+		dstMount.SubPath = "upper" // Mount only upper/ for OS volumes
+	}
+
+	// Create copy pod with both volumes mounted at /src and /dst (NOT /sgs-os-volume)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: c.Namespace,
+			Labels: map[string]string{
+				sgs.LabelManagedBy:    "sgs",
+				"sgs.snucse.org/mode": "copy",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeSelector: map[string]string{
+				"kubernetes.io/hostname": nodeName,
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "copy",
+					Image: "busybox:latest",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0"),
+							corev1.ResourceMemory: resource.MustParse("0"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(sgs.EditCPULimit),
+							corev1.ResourceMemory: resource.MustParse(sgs.EditMemoryLimit),
+						},
+					},
+					VolumeMounts: []corev1.VolumeMount{srcMount, dstMount},
+					Command:      []string{"/bin/sh", "-c"},
+					Args:         []string{copyCmd + " && echo 'Copy complete'"},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "src",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: srcPVC,
+							ReadOnly:  true,
+						},
+					},
+				},
+				{
+					Name: "dst",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: dstPVC,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
+
+	_, err := c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create copy pod: %w", err)
+	}
+
+	// Register cleanup for interrupt handling
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "  Cleaning up copy pod...")
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+	defer func() {
+		cleanup.Unregister()
+		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), podName, metav1.DeleteOptions{})
+	}()
+
+	// Wait for pod to complete
+	if err := waitForCopyPod(ctx, c, podName, 30*time.Minute); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// copyPathCrossNode copies a specific path between different nodes using tar streaming.
+// Uses subPath: "upper" for OS volumes to expose only the user's filesystem.
+func copyPathCrossNode(ctx context.Context, c *client.Client,
+	srcNode, srcPVC, srcPath string, srcIsOS bool,
+	dstNode, dstPVC, dstPath string, dstIsOS bool) error {
+
+	srcPodName := "copy-src-" + srcPVC
+	dstPodName := "copy-dst-" + dstPVC
+	fmt.Printf("Copying %s to %s (cross-node)...\n", srcPath, dstPath)
+
+	// Create source pod (uses subPath for OS volumes)
+	srcPod := createCopyPod(srcPodName, srcNode, srcPVC, c.Namespace, true, srcIsOS)
+	_, err := c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, srcPod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create source pod: %w", err)
+	}
+
+	// Register cleanup for source pod
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "  Cleaning up source pod...")
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, srcPodName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+	defer func() {
+		cleanup.Unregister()
+		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), srcPodName, metav1.DeleteOptions{})
+	}()
+
+	// Create destination pod (uses subPath for OS volumes)
+	dstPod := createCopyPod(dstPodName, dstNode, dstPVC, c.Namespace, false, dstIsOS)
+	_, err = c.Clientset.CoreV1().Pods(c.Namespace).Create(ctx, dstPod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create destination pod: %w", err)
+	}
+
+	// Register cleanup for destination pod
+	cleanup.Register(func(cleanupCtx context.Context) {
+		fmt.Fprint(os.Stderr, "  Cleaning up destination pod...")
+		if err := c.Clientset.CoreV1().Pods(c.Namespace).Delete(cleanupCtx, dstPodName, metav1.DeleteOptions{}); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, " done")
+		}
+	})
+	defer func() {
+		cleanup.Unregister()
+		_ = c.Clientset.CoreV1().Pods(c.Namespace).Delete(context.Background(), dstPodName, metav1.DeleteOptions{})
+	}()
+
+	// Wait for pods to be running
+	fmt.Print("  Starting copy pods...")
+	if err := waitForPodRunning(ctx, c, srcPodName, 5*time.Minute); err != nil {
+		fmt.Println(" failed")
+		return fmt.Errorf("source pod failed to start: %w", err)
+	}
+	if err := waitForPodRunning(ctx, c, dstPodName, 5*time.Minute); err != nil {
+		fmt.Println(" failed")
+		return fmt.Errorf("destination pod failed to start: %w", err)
+	}
+	fmt.Println(" done")
+
+	// First, create destination directory
+	fmt.Println("  Creating destination directory...")
+	var mkdirStderr bytes.Buffer
+	mkdirCmd := []string{"mkdir", "-p", "/data/" + dstPath}
+	if err := execInPod(ctx, c, dstPodName, mkdirCmd, nil, nil, &mkdirStderr); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w: %s", err, mkdirStderr.String())
+	}
+
+	// Stream data: tar from source path | tar to destination path
+	fmt.Println("  Streaming data between nodes...")
+
+	pr, pw := io.Pipe()
+
+	// Progress tracking
+	var progressMu sync.Mutex
+	var lastPrinted int64
+	progress := &progressWriter{
+		writer: pw,
+		onWrite: func(total int64) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			if total-lastPrinted >= 1024*1024 {
+				fmt.Printf("\r  Transferred: %s", formatBytes(total))
+				lastPrinted = total
+			}
+		},
+	}
+
+	var srcStderr, dstStderr bytes.Buffer
+	errChan := make(chan error, 2)
+
+	// Source: tar from the specific path
+	go func() {
+		defer pw.Close()
+		// tar cf - -C /data/<srcPath> . to tar contents of the source path
+		err := execInPod(ctx, c, srcPodName, []string{"tar", "cf", "-", "-C", "/data/" + srcPath, "."}, nil, progress, &srcStderr)
+		if err != nil && srcStderr.Len() > 0 {
+			err = fmt.Errorf("%w: %s", err, srcStderr.String())
+		}
+		errChan <- err
+	}()
+
+	// Destination: extract to the specific path
+	go func() {
+		err := execInPod(ctx, c, dstPodName, []string{"tar", "xf", "-", "-C", "/data/" + dstPath}, pr, nil, &dstStderr)
+		if err != nil && dstStderr.Len() > 0 {
+			err = fmt.Errorf("%w: %s", err, dstStderr.String())
+		}
+		errChan <- err
+	}()
+
+	// Wait for both to complete
+	for i := 0; i < 2; i++ {
+		if err := <-errChan; err != nil {
+			return fmt.Errorf("copy stream failed: %w", err)
+		}
+	}
+
+	fmt.Printf("\r  Transferred: %s\n", formatBytes(progress.written))
+	return nil
 }

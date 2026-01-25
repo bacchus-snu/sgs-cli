@@ -1,23 +1,29 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/bacchus-snu/sgs-cli/internal/client"
 	"github.com/bacchus-snu/sgs-cli/internal/volume"
 	"github.com/spf13/cobra"
 )
 
+var deleteForce bool
+
 var deleteCmd = &cobra.Command{
-	Use:   "delete",
-	Short: "Delete a resource",
+	Use:     "delete",
+	Aliases: []string{"del"},
+	Short:   "Delete a resource (del)",
 }
 
 var deleteVolumeCmd = &cobra.Command{
 	Use:     "volume <node>/<volume>",
-	Aliases: []string{"volumes"},
-	Short:   "Delete a volume",
+	Aliases: []string{"volumes", "vo", "vol"},
+	Short:   "Delete a volume (vo, vol)",
 	Long: `Delete a persistent volume.
 
 This will delete both the Pod and the PersistentVolumeClaim.
@@ -32,8 +38,8 @@ Examples:
 
 var deleteSessionCmd = &cobra.Command{
 	Use:     "session <node>/<volume>",
-	Aliases: []string{"sessions"},
-	Short:   "Delete a session",
+	Aliases: []string{"sessions", "se"},
+	Short:   "Delete a session (se)",
 	Long: `Delete a session.
 
 Examples:
@@ -44,6 +50,7 @@ Examples:
 }
 
 func init() {
+	deleteVolumeCmd.Flags().BoolVarP(&deleteForce, "force", "f", false, "Skip confirmation prompt")
 	deleteCmd.AddCommand(deleteVolumeCmd)
 	deleteCmd.AddCommand(deleteSessionCmd)
 }
@@ -55,6 +62,24 @@ func runDeleteVolume(cmd *cobra.Command, args []string) {
 	nodeName, volumeName, err := volume.ParseVolumePath(volumePath)
 	if err != nil {
 		exitWithError("invalid volume path", err)
+	}
+
+	// Require confirmation unless --force is set
+	if !deleteForce {
+		fmt.Printf("WARNING: This will permanently delete volume '%s/%s' and all its data!\n", nodeName, volumeName)
+		fmt.Printf("Type the volume name to confirm: ")
+
+		reader := bufio.NewReader(os.Stdin)
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			exitWithError("failed to read input", err)
+		}
+
+		input = strings.TrimSpace(input)
+		if input != volumePath {
+			fmt.Println("Aborted: confirmation does not match")
+			os.Exit(1)
+		}
 	}
 
 	ctx := context.Background()

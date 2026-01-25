@@ -16,8 +16,9 @@ var (
 )
 
 var logsCmd = &cobra.Command{
-	Use:   "logs <node>/<volume>",
-	Short: "Print logs from a session",
+	Use:     "logs <node>/<volume>",
+	Aliases: []string{"log"},
+	Short:   "Print logs from a session (log)",
 	Long: `Print logs from a session (edit or run pod).
 
 Session path format: <node>/<volume>
