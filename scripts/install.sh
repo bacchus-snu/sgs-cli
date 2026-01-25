@@ -58,7 +58,7 @@ select_version() {
   done
 
   printf "\nSelect version [1]: "
-  read -r choice
+  read -r choice </dev/tty
   choice=${choice:-1}
 
   if [ "$choice" = "1" ]; then
@@ -75,7 +75,7 @@ select_install_path() {
   printf "  2) ~/.local/bin (no sudo, add to PATH if needed)\n"
 
   printf "\nSelect installation path [1]: "
-  read -r choice
+  read -r choice </dev/tty
   choice=${choice:-1}
 
   if [ "$choice" = "1" ]; then
