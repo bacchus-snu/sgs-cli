@@ -1,6 +1,5 @@
 # SGS - SNUCSE GPU Service CLI
 
-[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A command line interface for SNUCSE GPU Service. It provides a VM-like experience for GPU computing on Kubernetes, abstracting away Kubernetes complexity.
@@ -10,29 +9,6 @@ A command line interface for SNUCSE GPU Service. It provides a VM-like experienc
 - **VM-like Experience**: Create persistent volumes that feel like virtual machines
 - **Simple Interface**: Only three concepts - nodes, volumes, and sessions
 - **Workspace Management**: Namespace-based workspace isolation and resource quota management, shared with multiple users
-
-## Project Structure
-
-```text
-sgs-cli/
-├── cmd/
-│   └── sgs/              # Application entry point
-│       └── main.go
-├── internal/             # Private application code
-│   ├── cleanup/          # Interrupt handling and cleanup registry
-│   ├── client/           # Kubernetes client with retry logic
-│   ├── cmd/              # CLI commands (Cobra)
-│   ├── node/             # Node operations
-│   ├── session/          # Session operations
-│   ├── sgs/              # Shared configuration and constants
-│   ├── user/             # User identity from OIDC tokens
-│   ├── volume/           # Volume and session management
-│   └── workspace/        # Workspace operations
-├── go.mod
-├── go.sum
-├── Makefile
-└── README.md
-```
 
 ## Configuration
 
@@ -46,7 +22,6 @@ The configuration is automatically refreshed if more than 7 days have passed sin
 
 ## Prerequisites
 
-- Go 1.25 or higher
 - Access to SNUCSE GPU Service
 
 ## Installation
@@ -74,6 +49,8 @@ The installer will:
 Download binaries directly from [GitHub Releases](https://github.com/bacchus-snu/sgs-cli/releases).
 
 ### From Source
+
+Requires Go 1.25 or higher.
 
 ```bash
 git clone https://github.com/bacchus-snu/sgs-cli.git
@@ -144,8 +121,11 @@ sgs create volume ferrari/os-volume --image pytorch/pytorch:2.0.0-cuda11.7-cudnn
 # Create a data volume (storage only)
 sgs create volume ferrari/data-vol --size 100Gi
 
-# Copy a volume (same or different node)
+# Copy entire volume (same or different node)
 sgs cp ferrari/os-volume porsche/os-volume
+
+# Copy files/directories between volumes
+sgs cp ferrari/data:/datasets/mnist porsche/data:/datasets/
 
 # Delete a volume
 sgs delete volume ferrari/os-volume
@@ -153,34 +133,50 @@ sgs delete volume ferrari/os-volume
 
 ### Session Management
 
-Sessions run on OS volumes. Two types exist:
+Sessions run on OS volumes. Only one session can run per OS volume at a time.
 
-- **Edit session (0)**: Interactive shell, no GPU, limited resources
-- **Run session (1+)**: GPU workloads with specified command, may be shutdown under low GPU utilization
+- **Edit mode** (default): Interactive shell for code editing, minimal GPU access
+- **Run mode** (`--run`): GPU workloads with specified resources and command
 
 ```bash
 # Start an edit session (interactive shell)
 sgs create session ferrari/os-volume
 
-# Start an edit session with mounted data volume
+# Start and attach to session immediately
+sgs create session ferrari/os-volume --attach
+
+# Start with mounted data volume
 sgs create session ferrari/os-volume --mount ferrari/data-vol:/data
 
-# Start a run session with GPU (auto-assign session number)
-sgs create session ferrari/os-volume --gpu 2 --command "python train.py"
+# Start a run session with GPU (--gpu-num and --gpu-mem required)
+sgs create session ferrari/os-volume --run --gpu-num 2 --gpu-mem 16384 --command "python train.py"
 
-# Start a run session with specific session number
-sgs create session ferrari/os-volume/3 --gpu 1 --command "python train.py"
-
-# View session logs (session number optional, defaults to 0)
+# View session logs
 sgs logs ferrari/os-volume
-sgs logs ferrari/os-volume/1
+sgs logs ferrari/os-volume -f  # Follow logs
 
-# Delete the edit session (session 0)
+# Delete session
 sgs delete session ferrari/os-volume
-
-# Delete a specific run session
-sgs delete session ferrari/os-volume/1
 ```
+
+### Command Aliases
+
+| Command  | Aliases   |
+|----------|-----------|
+| describe | des, desc |
+| create   | cr        |
+| delete   | del       |
+| attach   | at        |
+| fetch    | fet       |
+| logs     | log       |
+| version  | ver       |
+
+| Resource  | Aliases   |
+|-----------|-----------|
+| node      | no        |
+| session   | se        |
+| volume    | vo, vol   |
+| workspace | ws        |
 
 ## Concepts
 
@@ -197,10 +193,12 @@ Persistent storage that behaves like VM disks. Two types:
 
 ### Sessions
 
-Running pods on OS volumes. Named as `<node>/<volume>/<number>`:
+Running pods on OS volumes. Named as `<node>/<volume>`.
 
-- Session 0: Edit mode (interactive shell, no GPU)
-- Session 1+: Run mode (GPU workloads with command)
+- **Edit mode**: Interactive shell for development (default)
+- **Run mode**: GPU workloads with command (`--run` flag)
+
+Note: Only one session can run per OS volume at a time.
 
 ### Workspaces
 

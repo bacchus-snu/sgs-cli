@@ -14,6 +14,7 @@ import (
 	"github.com/bacchus-snu/sgs-cli/internal/volume"
 	"github.com/bacchus-snu/sgs-cli/internal/workspace"
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 )
 
 var getCmd = &cobra.Command{
@@ -57,35 +58,20 @@ func runGet(cmd *cobra.Command, args []string) {
 		name = args[1]
 	}
 
+	// get always shows table format (even for single items)
 	switch resource {
 	case "all":
 		getAll(ctx, k8sClient, false)
 	case "nodes", "node", "no":
-		if name == "" {
-			getNodes(ctx, k8sClient, false)
-		} else {
-			getNode(ctx, k8sClient, name, false)
-		}
+		getNodes(ctx, k8sClient, false, name) // name is filter (empty = all)
 	case "volumes", "volume", "vo", "vol":
-		if name == "" {
-			getVolumes(ctx, k8sClient, false)
-		} else {
-			getVolume(ctx, k8sClient, name, false)
-		}
+		getVolumes(ctx, k8sClient, false, name) // name is filter (empty = all)
 	case "sessions", "session", "se":
-		if name == "" {
-			getSessions(ctx, k8sClient, false)
-		} else {
-			getSession(ctx, k8sClient, name, false)
-		}
+		getSessions(ctx, k8sClient, false, name) // name is filter (empty = all)
 	case "workspaces", "workspace", "ws":
-		if name == "" {
-			getWorkspaces(ctx, k8sClient, false)
-		} else {
-			getWorkspace(ctx, k8sClient, name, false)
-		}
+		getWorkspaces(ctx, k8sClient, false, name) // name is filter (empty = all)
 	case "current-workspace":
-		getWorkspace(ctx, k8sClient, "", false)
+		describeWorkspace(ctx, k8sClient, "", false) // special case: detailed format
 	case "me":
 		getMe(false)
 	default:
@@ -93,7 +79,7 @@ func runGet(cmd *cobra.Command, args []string) {
 	}
 }
 
-func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool) {
+func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool, filterName string) {
 	nodes, err := node.ListWorkerNodes(ctx, k8sClient)
 	if err != nil {
 		exitWithError("", err)
@@ -104,11 +90,26 @@ func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 		return
 	}
 
+	// Filter nodes if a specific name is provided
+	if filterName != "" {
+		found := false
+		for _, n := range nodes {
+			if n.Name == filterName {
+				nodes = []corev1.Node{n}
+				found = true
+				break
+			}
+		}
+		if !found {
+			exitWithError(fmt.Sprintf("node %q not found", filterName), nil)
+		}
+	}
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if verbose {
-		fmt.Fprintln(w, "NAME\tACCESS\tSTATUS\tCPU (used/total)\tMEMORY (used/total)\tGPU (used/total)")
+		fmt.Fprintln(w, "NAME\tACCESS\tSTATUS\tCPU (alloc/cap)\tMEM (alloc/cap)\tGPU (alloc/cap)\tGPU MEM (alloc/cap)")
 	} else {
-		fmt.Fprintln(w, "NAME\tACCESS\tSTATUS\tGPU (used/total)")
+		fmt.Fprintln(w, "NAME\tACCESS\tSTATUS\tGPU (alloc/cap)\tGPU MEM (alloc/cap)")
 	}
 
 	for _, n := range nodes {
@@ -130,23 +131,53 @@ func getNodes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 			continue
 		}
 
+		// Format metrics strings
+		cpuStr := formatCPUMetrics(info)
+		memStr := formatMemMetrics(info)
+		gpuStr := formatGPUMetrics(info)
+		gpuMemStr := formatGPUMemMetrics(info)
+
 		if verbose {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s/%s\t%s/%s\t%d/%d\n",
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				n.Name, access, status,
-				info.CPUUsed, info.CPUTotal,
-				info.MemoryUsed, info.MemoryTotal,
-				info.GPUUsed, info.GPUTotal)
+				cpuStr, memStr, gpuStr, gpuMemStr)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\n",
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 				n.Name, access, status,
-				info.GPUUsed, info.GPUTotal)
+				gpuStr, gpuMemStr)
 		}
 	}
 	w.Flush()
 
 	if verbose {
-		fmt.Println("\nNote: CPU/memory usage shows total limits. Due to oversubscription, usage may exceed physical capacity.")
+		fmt.Println("\nNote: 'alloc' shows sum of pod limits (may exceed capacity due to oversubscription).")
 	}
+}
+
+// formatCPUMetrics formats CPU metrics as "alloc/cap"
+func formatCPUMetrics(info *node.ResourceInfo) string {
+	return fmt.Sprintf("%.1f/%.1f", info.CPUAlloc, info.CPUCapacity)
+}
+
+// formatMemMetrics formats memory metrics as "alloc/cap GiB"
+func formatMemMetrics(info *node.ResourceInfo) string {
+	return fmt.Sprintf("%.1f/%.1fGiB", info.MemAlloc, info.MemCapacity)
+}
+
+// formatGPUMetrics formats GPU metrics as "alloc/cap" or "-" if no GPU
+func formatGPUMetrics(info *node.ResourceInfo) string {
+	if info.GPUCapacity == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d/%d", info.GPUAlloc, info.GPUCapacity)
+}
+
+// formatGPUMemMetrics formats GPU memory metrics as "alloc/cap GiB" or "-" if no GPU
+func formatGPUMemMetrics(info *node.ResourceInfo) string {
+	if info.GPUCapacity == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f/%.1fGiB", info.GPUMemAlloc, info.GPUMemCapacity)
 }
 
 // formatNodeAccess formats the node access for display based on the new access rules.
@@ -172,7 +203,7 @@ func formatWorkspaceAccess(nodeGroup string) string {
 	return nodeGroup
 }
 
-func getVolumes(ctx context.Context, k8sClient *client.Client, verbose bool) {
+func getVolumes(ctx context.Context, k8sClient *client.Client, verbose bool, filterPath string) {
 	volumes, err := volume.List(ctx, k8sClient)
 	if err != nil {
 		exitWithError("", err)
@@ -181,6 +212,25 @@ func getVolumes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	if len(volumes) == 0 {
 		fmt.Println("No volumes found in current workspace")
 		return
+	}
+
+	// Filter volumes if a specific path is provided (node/volume format)
+	if filterPath != "" {
+		filterNode, filterName, err := volume.ParseVolumePath(filterPath)
+		if err != nil {
+			exitWithError("invalid volume path", err)
+		}
+		found := false
+		for _, v := range volumes {
+			if v.NodeName == filterNode && v.VolumeName == filterName {
+				volumes = []volume.VolumeInfo{v}
+				found = true
+				break
+			}
+		}
+		if !found {
+			exitWithError(fmt.Sprintf("volume %q not found in current workspace", filterPath), nil)
+		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -211,10 +261,10 @@ func getVolumes(ctx context.Context, k8sClient *client.Client, verbose bool) {
 }
 
 func getNodeInfo(ctx context.Context, k8sClient *client.Client, nodeName string, verbose bool) {
-	getNode(ctx, k8sClient, nodeName, verbose)
+	describeNode(ctx, k8sClient, nodeName, verbose)
 }
 
-func getNode(ctx context.Context, k8sClient *client.Client, nodeName string, verbose bool) {
+func describeNode(ctx context.Context, k8sClient *client.Client, nodeName string, verbose bool) {
 	info, err := node.GetResourceInfo(ctx, k8sClient, nodeName)
 	if err != nil {
 		exitWithError("", err)
@@ -222,10 +272,17 @@ func getNode(ctx context.Context, k8sClient *client.Client, nodeName string, ver
 
 	fmt.Printf("Node: %s\n", nodeName)
 	fmt.Printf("  Access:  %s\n", formatNodeAccess(info.Group))
-	fmt.Printf("  CPU:     %s / %s\n", info.CPUUsed, info.CPUTotal)
-	fmt.Printf("  Memory:  %s / %s\n", info.MemoryUsed, info.MemoryTotal)
-	fmt.Printf("  GPU:     %d / %d\n", info.GPUUsed, info.GPUTotal)
-	fmt.Printf("  Storage: %s / %s\n", info.StorageUsed, info.StorageTotal)
+	fmt.Printf("  CPU:     %s\n", formatCPUMetrics(info))
+	fmt.Printf("  Memory:  %s\n", formatMemMetrics(info))
+	if info.GPUCapacity > 0 {
+		fmt.Printf("  GPU:     %s\n", formatGPUMetrics(info))
+		fmt.Printf("  GPU Mem: %s\n", formatGPUMemMetrics(info))
+		if info.GPUType != "" {
+			fmt.Printf("  GPU Type: %s\n", info.GPUType)
+		}
+	} else {
+		fmt.Printf("  GPU:     (none)\n")
+	}
 
 	if verbose {
 		fmt.Printf("\nVolumes on this node:\n")
@@ -273,7 +330,7 @@ func getMe(verbose bool) {
 	fmt.Printf("Groups: %s\n", strings.Join(u.Groups, ", "))
 }
 
-func getVolume(ctx context.Context, k8sClient *client.Client, volumePath string, verbose bool) {
+func describeVolume(ctx context.Context, k8sClient *client.Client, volumePath string, verbose bool) {
 	// Parse node/volume path
 	nodeName, volumeName, err := volume.ParseVolumePath(volumePath)
 	if err != nil {
@@ -297,7 +354,7 @@ func getVolume(ctx context.Context, k8sClient *client.Client, volumePath string,
 
 	if verbose {
 		fmt.Printf("\nSessions using this volume:\n")
-		sessions, err := session.ListByVolume(ctx, k8sClient, volumePath)
+		sessions, err := session.ListByVolume(ctx, k8sClient, volumeName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to list sessions: %v\n", err)
 			return
@@ -312,13 +369,22 @@ func getVolume(ctx context.Context, k8sClient *client.Client, volumePath string,
 	}
 }
 
-func getSession(ctx context.Context, k8sClient *client.Client, sessionName string, verbose bool) {
-	s, err := session.Get(ctx, k8sClient, sessionName)
+func describeSession(ctx context.Context, k8sClient *client.Client, sessionName string, verbose bool) {
+	// Convert node/volume path format to pod name format (node-volume)
+	podName := sessionName
+	if strings.Contains(sessionName, "/") {
+		parts := strings.SplitN(sessionName, "/", 2)
+		podName = parts[0] + "-" + parts[1]
+	}
+
+	s, err := session.Get(ctx, k8sClient, podName)
 	if err != nil {
 		exitWithError("", err)
 	}
 
-	fmt.Printf("Session: %s\n", sessionName)
+	// Display with original format (node/volume) for consistency
+	displayName := fmt.Sprintf("%s/%s", s.Node, s.VolumeName)
+	fmt.Printf("Session: %s\n", displayName)
 	fmt.Printf("  Type:   %s\n", s.Type)
 	fmt.Printf("  Volume: %s\n", s.VolumeName)
 	fmt.Printf("  Node:   %s\n", s.Node)
@@ -327,7 +393,7 @@ func getSession(ctx context.Context, k8sClient *client.Client, sessionName strin
 	fmt.Printf("  Age:    %s\n", s.Age)
 }
 
-func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool) {
+func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool, filterName string) {
 	workspaces, err := workspace.List(ctx, k8sClient)
 	if err != nil {
 		exitWithError("", err)
@@ -336,6 +402,21 @@ func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool) 
 	if len(workspaces) == 0 {
 		fmt.Println("No accessible workspaces found")
 		return
+	}
+
+	// Filter workspaces if a specific name is provided
+	if filterName != "" {
+		found := false
+		for _, ws := range workspaces {
+			if ws.Name == filterName {
+				workspaces = []workspace.WorkspaceInfo{ws}
+				found = true
+				break
+			}
+		}
+		if !found {
+			exitWithError(fmt.Sprintf("workspace %q not found or access denied", filterName), nil)
+		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -362,7 +443,7 @@ func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool) 
 	w.Flush()
 }
 
-func getWorkspace(ctx context.Context, k8sClient *client.Client, name string, verbose bool) {
+func describeWorkspace(ctx context.Context, k8sClient *client.Client, name string, verbose bool) {
 	var ws *workspace.WorkspaceInfo
 	var err error
 
@@ -392,7 +473,7 @@ func getWorkspace(ctx context.Context, k8sClient *client.Client, name string, ve
 	}
 }
 
-func getSessions(ctx context.Context, k8sClient *client.Client, verbose bool) {
+func getSessions(ctx context.Context, k8sClient *client.Client, verbose bool, filterName string) {
 	sessions, err := session.List(ctx, k8sClient)
 	if err != nil {
 		exitWithError("", err)
@@ -401,6 +482,23 @@ func getSessions(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	if len(sessions) == 0 {
 		fmt.Println("No sessions found in current workspace")
 		return
+	}
+
+	// Filter sessions if a specific name is provided (node/volume or pod name format)
+	if filterName != "" {
+		found := false
+		for _, s := range sessions {
+			// Match by pod name or by node/volume path
+			sessionPath := fmt.Sprintf("%s/%s", s.Node, s.VolumeName)
+			if s.PodName == filterName || sessionPath == filterName {
+				sessions = []session.SessionInfo{s}
+				found = true
+				break
+			}
+		}
+		if !found {
+			exitWithError(fmt.Sprintf("session %q not found in current workspace", filterName), nil)
+		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -435,6 +533,88 @@ func truncateCommand(cmd string, maxLen int) string {
 	return cmd[:maxLen-3] + "..."
 }
 
+// describeNodes shows detailed info for all nodes (concatenated describe output)
+func describeNodes(ctx context.Context, k8sClient *client.Client) {
+	nodes, err := node.ListWorkerNodes(ctx, k8sClient)
+	if err != nil {
+		exitWithError("", err)
+	}
+
+	if len(nodes) == 0 {
+		fmt.Println("No worker nodes found")
+		return
+	}
+
+	for i, n := range nodes {
+		if i > 0 {
+			fmt.Println() // Separator between nodes
+		}
+		describeNode(ctx, k8sClient, n.Name, true)
+	}
+}
+
+// describeVolumes shows detailed info for all volumes (concatenated describe output)
+func describeVolumes(ctx context.Context, k8sClient *client.Client) {
+	volumes, err := volume.List(ctx, k8sClient)
+	if err != nil {
+		exitWithError("", err)
+	}
+
+	if len(volumes) == 0 {
+		fmt.Println("No volumes found in current workspace")
+		return
+	}
+
+	for i, v := range volumes {
+		if i > 0 {
+			fmt.Println() // Separator between volumes
+		}
+		volumePath := fmt.Sprintf("%s/%s", v.NodeName, v.VolumeName)
+		describeVolume(ctx, k8sClient, volumePath, true)
+	}
+}
+
+// describeSessions shows detailed info for all sessions (concatenated describe output)
+func describeSessions(ctx context.Context, k8sClient *client.Client) {
+	sessions, err := session.List(ctx, k8sClient)
+	if err != nil {
+		exitWithError("", err)
+	}
+
+	if len(sessions) == 0 {
+		fmt.Println("No sessions found in current workspace")
+		return
+	}
+
+	for i, s := range sessions {
+		if i > 0 {
+			fmt.Println() // Separator between sessions
+		}
+		// Use PodName directly since that's what session.Get expects
+		describeSession(ctx, k8sClient, s.PodName, true)
+	}
+}
+
+// describeWorkspaces shows detailed info for all workspaces (concatenated describe output)
+func describeWorkspaces(ctx context.Context, k8sClient *client.Client) {
+	workspaces, err := workspace.List(ctx, k8sClient)
+	if err != nil {
+		exitWithError("", err)
+	}
+
+	if len(workspaces) == 0 {
+		fmt.Println("No accessible workspaces found")
+		return
+	}
+
+	for i, ws := range workspaces {
+		if i > 0 {
+			fmt.Println() // Separator between workspaces
+		}
+		describeWorkspace(ctx, k8sClient, ws.Name, true)
+	}
+}
+
 // getAll displays all resources (nodes, volumes, sessions, workspaces)
 func getAll(ctx context.Context, k8sClient *client.Client, verbose bool) {
 	// Get current workspace for header
@@ -442,20 +622,20 @@ func getAll(ctx context.Context, k8sClient *client.Client, verbose bool) {
 
 	// Workspaces
 	fmt.Println("--- Workspaces ---")
-	getWorkspaces(ctx, k8sClient, verbose)
+	getWorkspaces(ctx, k8sClient, verbose, "")
 	fmt.Println()
 
 	// Nodes
 	fmt.Println("--- Nodes ---")
-	getNodes(ctx, k8sClient, verbose)
+	getNodes(ctx, k8sClient, verbose, "")
 	fmt.Println()
 
 	// Volumes
 	fmt.Printf("--- Volumes (workspace: %s) ---\n", currentWS)
-	getVolumes(ctx, k8sClient, verbose)
+	getVolumes(ctx, k8sClient, verbose, "")
 	fmt.Println()
 
 	// Sessions
 	fmt.Printf("--- Sessions (workspace: %s) ---\n", currentWS)
-	getSessions(ctx, k8sClient, verbose)
+	getSessions(ctx, k8sClient, verbose, "")
 }

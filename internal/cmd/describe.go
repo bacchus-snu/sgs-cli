@@ -55,27 +55,27 @@ func runDescribe(cmd *cobra.Command, args []string) {
 		getAll(ctx, k8sClient, true)
 	case "nodes", "node", "no":
 		if name == "" {
-			getNodes(ctx, k8sClient, true)
+			describeNodes(ctx, k8sClient)
 		} else {
-			getNode(ctx, k8sClient, name, true)
+			describeNode(ctx, k8sClient, name, true)
 		}
 	case "volumes", "volume", "vo", "vol":
 		if name == "" {
-			getVolumes(ctx, k8sClient, true)
+			describeVolumes(ctx, k8sClient)
 		} else {
-			getVolume(ctx, k8sClient, name, true)
+			describeVolume(ctx, k8sClient, name, true)
 		}
 	case "sessions", "session", "se":
 		if name == "" {
-			getSessions(ctx, k8sClient, true)
+			describeSessions(ctx, k8sClient)
 		} else {
-			getSession(ctx, k8sClient, name, true)
+			describeSession(ctx, k8sClient, name, true)
 		}
 	case "workspaces", "workspace", "ws":
 		if name == "" {
-			getWorkspaces(ctx, k8sClient, true)
+			describeWorkspaces(ctx, k8sClient)
 		} else {
-			getWorkspace(ctx, k8sClient, name, true)
+			describeWorkspace(ctx, k8sClient, name, true)
 		}
 	case "me":
 		getMe(true)
