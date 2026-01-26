@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/bacchus-snu/sgs-cli/internal/sgs"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -377,7 +378,7 @@ func SetWorkspace(workspace string) error {
 				context = make(map[string]interface{})
 				ctxMap["context"] = context
 			}
-			context["namespace"] = workspace
+			context["namespace"] = sgs.WorkspaceToNamespace(workspace)
 			break
 		}
 	}

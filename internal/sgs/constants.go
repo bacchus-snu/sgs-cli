@@ -1,6 +1,8 @@
 // Package sgs provides shared constants and types for the SGS CLI.
 package sgs
 
+import "strings"
+
 // Label keys for Kubernetes resources
 const (
 	LabelManagedBy      = "app.kubernetes.io/managed-by"
@@ -39,3 +41,19 @@ const (
 
 // Beacon mount path - the runtime wrapper detects this path to trigger root swap
 const BeaconMount = "/sgs-os-volume"
+
+// Workspace namespace prefix - workspace namespaces are named ws-<workspace>
+const WorkspacePrefix = "ws-"
+
+// WorkspaceToNamespace converts a workspace name to its Kubernetes namespace
+func WorkspaceToNamespace(workspace string) string {
+	if strings.HasPrefix(workspace, WorkspacePrefix) {
+		return workspace // already has prefix
+	}
+	return WorkspacePrefix + workspace
+}
+
+// NamespaceToWorkspace converts a Kubernetes namespace to workspace name (strips ws- prefix)
+func NamespaceToWorkspace(namespace string) string {
+	return strings.TrimPrefix(namespace, WorkspacePrefix)
+}

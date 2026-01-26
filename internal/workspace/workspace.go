@@ -13,6 +13,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ToNamespace converts a workspace name to its Kubernetes namespace
+var ToNamespace = sgs.WorkspaceToNamespace
+
+// FromNamespace converts a Kubernetes namespace to workspace name (strips ws- prefix)
+var FromNamespace = sgs.NamespaceToWorkspace
+
 // WorkspaceInfo represents information about an SGS workspace
 type WorkspaceInfo struct {
 	Name      string
@@ -58,7 +64,7 @@ func List(ctx context.Context, c *client.Client) ([]WorkspaceInfo, error) {
 			}
 
 			info := &WorkspaceInfo{
-				Name: ns.Name,
+				Name: FromNamespace(ns.Name),
 			}
 
 			// Parse node selector annotation for node group
@@ -105,9 +111,12 @@ func List(ctx context.Context, c *client.Client) ([]WorkspaceInfo, error) {
 
 // Get returns information about a specific workspace
 func Get(ctx context.Context, c *client.Client, name string) (*WorkspaceInfo, error) {
+	// Convert workspace name to K8s namespace (add ws- prefix)
+	nsName := ToNamespace(name)
+
 	// Get namespace with retry
 	ns, err := client.RetryWithContext(ctx, func() (*corev1.Namespace, error) {
-		return c.Clientset.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+		return c.Clientset.CoreV1().Namespaces().Get(ctx, nsName, metav1.GetOptions{})
 	})
 	if err != nil {
 		return nil, fmt.Errorf("workspace not found: %s", name)
@@ -120,14 +129,14 @@ func Get(ctx context.Context, c *client.Client, name string) (*WorkspaceInfo, er
 
 	// Try to access resource quotas to verify permission (with retry)
 	quotas, err := client.RetryWithContext(ctx, func() (*corev1.ResourceQuotaList, error) {
-		return c.Clientset.CoreV1().ResourceQuotas(name).List(ctx, metav1.ListOptions{})
+		return c.Clientset.CoreV1().ResourceQuotas(nsName).List(ctx, metav1.ListOptions{})
 	})
 	if err != nil {
 		return nil, fmt.Errorf("access denied to workspace: %s", name)
 	}
 
 	info := &WorkspaceInfo{
-		Name: name,
+		Name: FromNamespace(nsName), // Use name without prefix
 	}
 
 	// Parse node selector annotation
@@ -160,7 +169,8 @@ func GetCurrent(ctx context.Context, c *client.Client) (*WorkspaceInfo, error) {
 
 // Exists checks if a workspace exists (but doesn't check permission)
 func Exists(ctx context.Context, c *client.Client, name string) bool {
-	ns, err := c.Clientset.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+	nsName := ToNamespace(name) // Add ws- prefix for K8s API
+	ns, err := c.Clientset.CoreV1().Namespaces().Get(ctx, nsName, metav1.GetOptions{})
 	if err != nil {
 		return false
 	}

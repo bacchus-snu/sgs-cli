@@ -419,12 +419,13 @@ func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool, 
 		}
 	}
 
+	currentNS := workspace.FromNamespace(k8sClient.Namespace) // Strip ws- prefix for comparison
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if verbose {
 		fmt.Fprintln(w, "NAME\tACCESS\tGPU QUOTA\tCPU QUOTA\tMEM QUOTA")
 		for _, ws := range workspaces {
 			current := ""
-			if ws.Name == k8sClient.Namespace {
+			if ws.Name == currentNS {
 				current = " (current)"
 			}
 			fmt.Fprintf(w, "%s%s\t%s\t%d\t%s\t%s\n",
@@ -434,7 +435,7 @@ func getWorkspaces(ctx context.Context, k8sClient *client.Client, verbose bool, 
 		fmt.Fprintln(w, "NAME\tACCESS\tGPU QUOTA")
 		for _, ws := range workspaces {
 			current := ""
-			if ws.Name == k8sClient.Namespace {
+			if ws.Name == currentNS {
 				current = " (current)"
 			}
 			fmt.Fprintf(w, "%s%s\t%s\t%d\n", ws.Name, current, formatWorkspaceAccess(ws.NodeGroup), ws.GPUQuota)
@@ -460,7 +461,7 @@ func describeWorkspace(ctx context.Context, k8sClient *client.Client, name strin
 	}
 
 	current := ""
-	if ws.Name == k8sClient.Namespace {
+	if ws.Name == workspace.FromNamespace(k8sClient.Namespace) {
 		current = " (current)"
 	}
 
@@ -617,8 +618,8 @@ func describeWorkspaces(ctx context.Context, k8sClient *client.Client) {
 
 // getAll displays all resources (nodes, volumes, sessions, workspaces)
 func getAll(ctx context.Context, k8sClient *client.Client, verbose bool) {
-	// Get current workspace for header
-	currentWS := k8sClient.Namespace
+	// Get current workspace for header (strip ws- prefix for display)
+	currentWS := workspace.FromNamespace(k8sClient.Namespace)
 
 	// Workspaces
 	fmt.Println("--- Workspaces ---")
