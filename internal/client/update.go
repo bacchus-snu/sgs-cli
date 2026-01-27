@@ -159,14 +159,14 @@ func UpdateBinary(tempPath string) error {
 		return nil
 	}
 
-	// If direct rename fails (cross-device or permission), try copy
-	if err := copyFile(tempPath, execPath); err == nil {
+	// If direct rename fails (cross-device), try copy
+	if err := copyFile(tempPath, execPath); err != nil {
 		os.Remove(tempPath)
-		return nil
+		return fmt.Errorf("failed to replace binary: %w", err)
 	}
 
-	// If copy fails, might need sudo
-	return fmt.Errorf("permission denied - may need sudo")
+	os.Remove(tempPath)
+	return nil
 }
 
 // UpdateBinaryWithSudo uses sudo to replace the binary
@@ -211,6 +211,13 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer source.Close()
+
+	// Remove destination first to avoid ETXTBSY on running executables.
+	// On Linux, you cannot write to a running executable, but you can delete it
+	// (the process keeps running via its inode).
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 
 	dest, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
@@ -260,7 +267,8 @@ func PromptForUpdate() {
 
 	fmt.Println("Installing update...")
 	if err := UpdateBinary(tempPath); err != nil {
-		if strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "may need sudo") {
+		// Check for actual permission errors (handles wrapped errors)
+		if os.IsPermission(err) {
 			fmt.Print("Requires elevated permissions. Use sudo? [y/N]: ")
 			response, _ := reader.ReadString('\n')
 			response = strings.TrimSpace(strings.ToLower(response))
